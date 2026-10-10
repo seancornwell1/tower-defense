@@ -2,29 +2,27 @@ import Phaser from 'phaser';
 import { CFG, EnemyId, WeaponId, WEAPON_IDS } from '../config';
 import { Crate, Nest, Target, Zombie } from '../game/entities';
 import { Block, Tower } from '../game/tower';
-import { drawFx, fireHero, Fx, nearestTarget, Proj, updateProjectiles, updateWeapon } from '../game/combat';
-import { UI, WEAPONS } from '../game/meta';
-import { openTuning } from '../tuning';
+import {
+  drawFx, explode, fireBoomerang, fireHero, fireRocket, Fx, nearestTarget, Particles, Proj, throwGrenade,
+  updateProjectiles, updateWeapon, weaponDamage,
+} from '../game/combat';
+import { WEAPONS } from '../game/meta';
+import { button, Btn, fmt, txt } from '../art';
 
-declare const __BUILD_TIME__: string;
+export const GROUND_SCREEN_Y = 440;  // where the road sits on screen at any zoom
+const START_X = 300;
 
-const START_X = 220;
-const TRIPLE_TAP_ZONE = { w: 80, h: 64 };
+export type Mode = 'build' | 'battle' | 'won' | 'lost';
 
-type Phase = 'intro' | 'play' | 'won' | 'lost';
-
-interface ShopCard {
-  weapon: WeaponId;
-  bg: Phaser.GameObjects.Rectangle;
-  cost: Phaser.GameObjects.Text;
-}
+interface RocketJob { block: Block; left: number; timer: number }
 
 export class GameScene extends Phaser.Scene {
-  W = 540;
-  H = 960;
-  groundY = 700;
+  W = 960;
+  H = 540;
+  groundY = GROUND_SCREEN_Y;
 
-  phase: Phase = 'intro';
+  mode: Mode = 'build';
+  started = false;
   offered: WeaponId[] = [];
   tower!: Tower;
   zombies: Zombie[] = [];
@@ -32,17 +30,24 @@ export class GameScene extends Phaser.Scene {
   crates: Crate[] = [];
   projs: Proj[] = [];
   fx: Fx[] = [];
+  parts!: Particles;
+  abilityTime = {} as Record<WeaponId, number>;
+  rocketJobs: RocketJob[] = [];
+
   heroHp = 0;
   gold = 0;
+  energy = 0;
+  regenLevel = 0;
   kills = 0;
   section = 0;
   passedCheckpoints = 0;
   spawnTimer = 0;
   speedMult = 1;
-  elapsed = 0;
+  zoom = 1;
 
   hero!: Phaser.GameObjects.Container;
-  heroGun!: Phaser.GameObjects.Rectangle;
+  heroGun!: Phaser.GameObjects.Image;
+  heroBody!: Phaser.GameObjects.Image;
   heroCooldown = 0;
   heroAngle = 0;
   heroFlash = 0;
@@ -53,327 +58,163 @@ export class GameScene extends Phaser.Scene {
   dragStart = { x: 0, y: 0 };
   dragging = false;
   dragIndex = 0;
-  selected: Block | null = null;
-  tapTimes: number[] = [];
 
   gWorld!: Phaser.GameObjects.Graphics;
-  gHud!: Phaser.GameObjects.Graphics;
-  goldText!: Phaser.GameObjects.Text;
-  hpText!: Phaser.GameObjects.Text;
-  blocksText!: Phaser.GameObjects.Text;
-  trash!: Phaser.GameObjects.Rectangle;
-  trashLabel!: Phaser.GameObjects.Text;
-  speedBtn!: Phaser.GameObjects.Text;
-  shopCards: ShopCard[] = [];
-  selPanel: (Phaser.GameObjects.Rectangle | Phaser.GameObjects.Text)[] = [];
-  selText!: Phaser.GameObjects.Text;
-  selBtn!: Phaser.GameObjects.Rectangle;
-  selBtnText!: Phaser.GameObjects.Text;
-  hintText!: Phaser.GameObjects.Text;
-  overlay: Phaser.GameObjects.Container | null = null;
+  panels: Phaser.GameObjects.GameObject[] = [];
+  panelsKey = '';
 
   constructor() {
     super('game');
   }
 
-  get finishX(): number {
-    return START_X + CFG.stage.length;
+  get finishX(): number { return START_X + CFG.stage.length; }
+  get regen(): number { return CFG.energy.regen + CFG.energy.regenUpgrade * this.regenLevel; }
+  get regenCost(): number { return CFG.energy.upgradeCostBase + CFG.energy.upgradeCostStep * this.regenLevel; }
+  get hud(): Phaser.Scene & { toast(s: string): void; flyCoin(x: number, y: number): void; banner(s: string): void; showResult(won: boolean): void } {
+    return this.scene.get('hud') as never;
   }
 
   checkpointX(k: number): number {
     return START_X + (CFG.stage.length * k) / CFG.stage.sections;
   }
 
-  hpMult(): number {
-    return CFG.stage.difficulty * (1 + CFG.stage.hpGrowthPerSection * this.section);
+  sectionAt(x: number): number {
+    return Phaser.Math.Clamp(Math.floor(((x - START_X) / CFG.stage.length) * CFG.stage.sections), 0, CFG.stage.sections - 1);
   }
 
-  dmgMult(): number {
-    return CFG.stage.difficulty * (1 + CFG.stage.dmgGrowthPerSection * this.section);
-  }
+  hpMult(): number { return CFG.stage.difficulty * (1 + CFG.stage.hpGrowthPerSection * this.section); }
+  dmgMult(): number { return CFG.stage.difficulty * (1 + CFG.stage.dmgGrowthPerSection * this.section); }
 
   targets(): Target[] {
-    return [...this.zombies, ...this.nests];
+    const out: Target[] = this.zombies.filter((z) => z.alive);
+    for (const n of this.nests) if (n.alive) out.push(n);
+    return out;
   }
+
+  // ---------------------------------------------------------------- setup
 
   create(): void {
     this.W = this.scale.width;
     this.H = this.scale.height;
-    this.groundY = this.H - 250;
     this.resetState();
-
-    this.cameras.main.setBackgroundColor(0xaab4c0);
-    this.buildBackground();
+    this.parts = new Particles(this);
+    this.buildWorld();
     this.tower = new Tower(this, START_X, this.groundY);
+    for (let i = 0; i < CFG.tower.startBlocks; i++) this.tower.addBlock(0);
+    this.tower.blocks.forEach((b) => (b.visY = this.tower.slotY(this.tower.blocks.indexOf(b))));
     this.buildHero();
-    this.spawnLevelObjects();
-    this.gWorld = this.add.graphics().setDepth(40);
-    this.buildHud();
-    this.setupInput();
-    this.showIntro();
-    this.cameras.main.scrollX = this.tower.x - 150;
-  }
-
-  resetState(): void {
-    this.phase = 'intro';
-    this.zombies = [];
-    this.nests = [];
-    this.crates = [];
-    this.projs = [];
-    this.fx = [];
-    this.shopCards = [];
-    this.heroHp = CFG.hero.hp;
-    this.gold = CFG.stage.startGold;
-    this.kills = 0;
-    this.section = 0;
-    this.passedCheckpoints = 0;
-    this.spawnTimer = CFG.spawns.startDelay;
-    this.elapsed = 0;
-    this.aimPointer = null;
-    this.dragBlock = null;
-    this.dragging = false;
-    this.selected = null;
-    this.overlay = null;
-    this.heroCooldown = 0;
-    this.heroAngle = 0;
-    const pool = Phaser.Utils.Array.Shuffle([...WEAPON_IDS]);
-    this.offered = pool.slice(0, 3);
-  }
-
-  // ---------------------------------------------------------------- world
-
-  buildBackground(): void {
-    const len = CFG.stage.length + 1200;
-    // far skyline (parallax)
-    const far = this.add.graphics().setScrollFactor(0.35).setDepth(0);
-    far.fillStyle(0x8e98a6);
-    let x = -100;
-    while (x < len * 0.35 + this.W + 200) {
-      const w = 50 + Math.random() * 70;
-      const h = 120 + Math.random() * 220;
-      far.fillRect(x, this.groundY - h, w, h);
-      x += w + 10 + Math.random() * 30;
-    }
-    const near = this.add.graphics().setScrollFactor(0.7).setDepth(1);
-    near.fillStyle(0x76808e);
-    x = -100;
-    while (x < len * 0.7 + this.W + 200) {
-      const w = 60 + Math.random() * 90;
-      const h = 60 + Math.random() * 160;
-      near.fillRect(x, this.groundY - h, w, h);
-      // broken windows
-      near.fillStyle(0x5c6572);
-      for (let wy = this.groundY - h + 12; wy < this.groundY - 20; wy += 26) {
-        for (let wx = x + 8; wx < x + w - 14; wx += 20) if (Math.random() < 0.7) near.fillRect(wx, wy, 10, 12);
-      }
-      near.fillStyle(0x76808e);
-      x += w + 20 + Math.random() * 60;
-    }
-    // ground
-    const g = this.add.graphics().setDepth(2);
-    g.fillStyle(0x5d5348);
-    g.fillRect(-400, this.groundY, len + 800, this.H - this.groundY);
-    g.fillStyle(0x4a4239);
-    g.fillRect(-400, this.groundY, len + 800, 8);
-    for (let gx = -400; gx < len + 400; gx += 90) g.fillRect(gx, this.groundY + 22, 40, 5);
-    // checkpoints + finish
-    for (let k = 1; k <= CFG.stage.sections; k++) {
-      const cx = this.checkpointX(k);
-      const isFinish = k === CFG.stage.sections;
-      g.fillStyle(isFinish ? 0x222222 : 0x3b6ea5);
-      g.fillRect(cx - 3, this.groundY - 190, 6, 190);
-      g.fillStyle(isFinish ? 0xffffff : 0x6aa6e8);
-      g.fillRect(cx + 3, this.groundY - 190, 46, 30);
-      this.add.text(cx + 26, this.groundY - 175, isFinish ? 'END' : `CP${k}`, { fontSize: '14px', color: '#111', fontStyle: 'bold' })
-        .setOrigin(0.5).setDepth(3);
-    }
-  }
-
-  spawnLevelObjects(): void {
     for (const f of CFG.stage.nestPositions) {
       const x = START_X + CFG.stage.length * f;
       this.nests.push(new Nest(this, x, CFG.stage.difficulty * (1 + CFG.stage.hpGrowthPerSection * this.sectionAt(x))));
     }
     for (const f of CFG.stage.cratePositions) this.crates.push(new Crate(this, START_X + CFG.stage.length * f));
+    this.gWorld = this.add.graphics().setDepth(40);
+    this.setupInput();
+    this.updateCamera(1);
+    this.scene.launch('hud');
+    this.scene.bringToTop('hud');
   }
 
-  sectionAt(x: number): number {
-    return Phaser.Math.Clamp(Math.floor(((x - START_X) / CFG.stage.length) * CFG.stage.sections), 0, CFG.stage.sections - 1);
+  resetState(): void {
+    this.mode = 'build';
+    this.started = false;
+    this.zombies = [];
+    this.nests = [];
+    this.crates = [];
+    this.projs = [];
+    this.fx = [];
+    this.rocketJobs = [];
+    this.panels = [];
+    this.panelsKey = '';
+    for (const w of WEAPON_IDS) this.abilityTime[w] = 0;
+    this.heroHp = CFG.hero.hp;
+    this.gold = CFG.stage.startGold;
+    this.energy = CFG.energy.start;
+    this.regenLevel = 0;
+    this.kills = 0;
+    this.section = 0;
+    this.passedCheckpoints = 0;
+    this.spawnTimer = CFG.spawns.startDelay;
+    this.aimPointer = null;
+    this.dragBlock = null;
+    this.dragging = false;
+    this.heroCooldown = 0;
+    this.heroAngle = 0;
+    this.zoom = 1;
+    this.offered = Phaser.Utils.Array.Shuffle([...WEAPON_IDS]).slice(0, 3)
+      .sort((a, b) => CFG.weapons[a].price - CFG.weapons[b].price);
+  }
+
+  buildWorld(): void {
+    const left = -1500;
+    const len = CFG.stage.length + 3500;
+    this.add.tileSprite(left, this.groundY - 4, len, 40, 'fence').setOrigin(0, 1).setDepth(1);
+    this.add.tileSprite(left, this.groundY - 8, len, 260, 'road').setOrigin(0, 0).setDepth(2);
+    for (let k = 1; k <= CFG.stage.sections; k++) {
+      const x = this.checkpointX(k);
+      const end = k === CFG.stage.sections;
+      this.add.image(x, this.groundY - 2, 'flag').setOrigin(0.1, 1).setScale(end ? 1 : 0.6).setDepth(3);
+      if (!end) txt(this, x + 14, this.groundY - 88, `${k}`, 16).setDepth(3);
+    }
   }
 
   buildHero(): void {
-    const body = this.add.rectangle(0, 6, 26, 32, 0x3f6fb5).setStrokeStyle(2, 0x1a2a44);
-    const head = this.add.rectangle(0, -18, 22, 20, 0xf0c8a0).setStrokeStyle(2, 0x5a4030);
-    const band = this.add.rectangle(0, -26, 24, 6, 0xd04040);
-    this.heroGun = this.add.rectangle(4, 0, 34, 8, 0x2a2a2a).setOrigin(0.1, 0.5);
-    this.hero = this.add.container(this.tower.x, 0, [body, head, band, this.heroGun]).setDepth(25);
+    const pole = this.add.rectangle(-14, -40, 4, 56, 0x5a5f6a).setStrokeStyle(2, 0x3a2621);
+    const canopy = this.add.image(-6, -70, 'canopy');
+    this.heroBody = this.add.image(0, -24, 'hero');
+    this.heroGun = this.add.image(2, -22, 'hero_gun').setOrigin(0.2, 0.5);
+    this.hero = this.add.container(this.tower.x, 0, [pole, canopy, this.heroBody, this.heroGun]).setDepth(25);
   }
 
-  // ---------------------------------------------------------------- HUD
+  // ---------------------------------------------------------------- camera
 
-  text(x: number, y: number, s: string, size = 16, color = UI.text): Phaser.GameObjects.Text {
-    return this.add.text(x, y, s, { fontFamily: UI.font, fontSize: `${size}px`, color, fontStyle: 'bold' })
-      .setScrollFactor(0).setDepth(110);
+  updateCamera(lerp: number): void {
+    const cam = this.cameras.main;
+    const n = Math.max(this.tower.blocks.length, 1);
+    const needed = CFG.tower.cartHeight + n * CFG.tower.blockHeight + 90;
+    const target = Phaser.Math.Clamp((GROUND_SCREEN_Y - 90) / needed, 0.6, 1);
+    this.zoom += (target - this.zoom) * lerp;
+    cam.setZoom(this.zoom);
+    const anchorX = this.mode === 'build' ? this.W * 0.3 : this.W * 0.26;
+    const midX = this.tower.x + (this.W / 2 - anchorX) / this.zoom;
+    const midY = this.groundY + (this.H / 2 - GROUND_SCREEN_Y) / this.zoom;
+    cam.centerOn(midX, midY);
   }
 
-  buildHud(): void {
-    this.gHud = this.add.graphics().setScrollFactor(0).setDepth(100);
-    this.goldText = this.text(this.W - 14, 46, '', 22, UI.gold).setOrigin(1, 0);
-    this.hpText = this.text(96, 50, '', 13).setOrigin(0.5, 0);
-    this.blocksText = this.text(this.W - 14, 74, '', 13, UI.dim).setOrigin(1, 0);
-    this.speedBtn = this.text(this.W - 14, 96, 'x1', 18).setOrigin(1, 0).setPadding(10, 4, 10, 4)
-      .setBackgroundColor('#3a3f4b').setInteractive();
-    this.speedBtn.on('pointerdown', () => {
-      this.speedMult = this.speedMult === 1 ? 2 : 1;
-      this.speedBtn.setText(`x${this.speedMult}`);
-    });
-
-    // trash can (top-left)
-    this.trash = this.add.rectangle(46, 128, 64, 64, 0x3a3f4b).setStrokeStyle(3, 0x22252b).setScrollFactor(0).setDepth(105);
-    this.trashLabel = this.text(46, 128, 'TRASH\nsell', 12, UI.dim).setOrigin(0.5).setAlign('center');
-
-    // bottom shop
-    const cardsTop = this.groundY + 118;
-    const cardH = this.H - cardsTop - 12;
-    const cardW = (this.W - 16 * 4) / 3;
-    this.add.rectangle(this.W / 2, this.groundY + 42 + (this.H - this.groundY - 42) / 2, this.W, this.H - this.groundY - 42, UI.panel)
-      .setScrollFactor(0).setDepth(100);
-    this.offered.forEach((w, i) => {
-      const meta = WEAPONS[w];
-      const cx = 16 + cardW / 2 + i * (cardW + 16);
-      const cy = cardsTop + cardH / 2;
-      const bg = this.add.rectangle(cx, cy, cardW, cardH, UI.panelLight).setStrokeStyle(3, meta.color)
-        .setScrollFactor(0).setDepth(105).setInteractive();
-      this.add.rectangle(cx, cardsTop + 18, cardW - 16, 10, meta.color).setScrollFactor(0).setDepth(106);
-      this.text(cx, cardsTop + 32, meta.name, 15).setOrigin(0.5, 0);
-      this.text(cx, cardsTop + 54, `${meta.reach} range${meta.hitsAir ? ' · air' : ''}`, 12, UI.dim).setOrigin(0.5, 0);
-      const cost = this.text(cx, cardsTop + cardH - 34, '', 18, UI.gold).setOrigin(0.5, 0);
-      bg.on('pointerdown', () => this.buyBlock(w));
-      this.shopCards.push({ weapon: w, bg, cost });
-    });
-
-    // selected block panel
-    const py = this.groundY + 78;
-    const selBg = this.add.rectangle(this.W / 2, py, this.W - 24, 54, 0x2b2f38).setStrokeStyle(2, 0x4a505c);
-    this.selText = this.add.text(26, py, '', { fontFamily: UI.font, fontSize: '14px', color: UI.text, fontStyle: 'bold' }).setOrigin(0, 0.5);
-    this.selBtn = this.add.rectangle(this.W - 100, py, 150, 40, 0x2f7d4f).setStrokeStyle(2, 0x1d4a30).setInteractive();
-    this.selBtnText = this.add.text(this.W - 100, py, '', { fontFamily: UI.font, fontSize: '14px', color: '#fff', fontStyle: 'bold', align: 'center' }).setOrigin(0.5);
-    this.selBtn.on('pointerdown', () => this.upgradeSelected());
-    this.selPanel = [selBg, this.selText, this.selBtn, this.selBtnText];
-    this.selPanel.forEach((o) => o.setScrollFactor(0).setDepth(108).setVisible(false));
-    this.hintText = this.text(this.W / 2, py, 'Buy a weapon block below · tap a block to upgrade · drag to reorder', 13, UI.dim)
-      .setOrigin(0.5).setWordWrapWidth(this.W - 40).setAlign('center');
-
-    this.text(this.W - 6, this.H - 6, `build ${__BUILD_TIME__}`, 9, '#6a707a').setOrigin(1, 1);
-  }
-
-  drawHud(): void {
-    const g = this.gHud;
-    g.clear();
-    // progress bar
-    const x0 = 96;
-    const x1 = this.W - 20;
-    const y = 18;
-    g.fillStyle(0x1d2027, 0.85);
-    g.fillRoundedRect(x0 - 8, y - 12, x1 - x0 + 16, 24, 8);
-    g.fillStyle(0x3a3f4b);
-    g.fillRect(x0, y - 4, x1 - x0, 8);
-    const prog = Phaser.Math.Clamp((this.tower.x - START_X) / CFG.stage.length, 0, 1);
-    g.fillStyle(0x6aa6e8);
-    g.fillRect(x0, y - 4, (x1 - x0) * prog, 8);
-    for (let k = 1; k <= CFG.stage.sections; k++) {
-      const cx = x0 + ((x1 - x0) * k) / CFG.stage.sections;
-      const done = k <= this.passedCheckpoints;
-      g.fillStyle(k === CFG.stage.sections ? 0xffffff : done ? 0x6aa6e8 : 0x8a909a);
-      g.fillCircle(cx, y, 7);
-    }
-    for (const n of this.nests) {
-      const nx = x0 + ((x1 - x0) * (n.x - START_X)) / CFG.stage.length;
-      g.fillStyle(n.alive ? 0xb05a3a : 0x555555);
-      g.fillRect(nx - 4, y - 10, 8, 6);
-    }
-    g.fillStyle(0xffd166);
-    g.fillTriangle(x0 + (x1 - x0) * prog - 7, y + 14, x0 + (x1 - x0) * prog + 7, y + 14, x0 + (x1 - x0) * prog, y + 5);
-
-    // hero HP bar
-    const hx = 30;
-    const hy = 46;
-    g.fillStyle(0x1d2027, 0.85);
-    g.fillRoundedRect(hx - 6, hy - 4, 144, 26, 6);
-    g.fillStyle(0x552222);
-    g.fillRect(hx, hy + 2, 132, 14);
-    g.fillStyle(0xd9534f);
-    g.fillRect(hx, hy + 2, 132 * Math.max(0, this.heroHp / CFG.hero.hp), 14);
-    this.hpText.setText(`HERO ${Math.ceil(Math.max(0, this.heroHp))}`);
-    this.goldText.setText(`${Math.floor(this.gold)} g`);
-    this.blocksText.setText(`blocks ${this.tower.blocks.length}/${CFG.tower.maxBlocks}`);
-
-    // trash state
-    const overTrash = this.dragging && this.dragPointer && this.isOverTrash(this.dragPointer);
-    this.trash.setFillStyle(overTrash ? 0xb04040 : this.dragging ? 0x6a3a3a : 0x3a3f4b);
-    if (this.dragging && this.dragBlock) this.trashLabel.setText(`SELL\n+${this.refund(this.dragBlock)}g`);
-    else this.trashLabel.setText('TRASH\nsell');
-
-    // shop
-    const cost = this.tower.blockCost();
-    const full = this.tower.blocks.length >= CFG.tower.maxBlocks;
-    for (const c of this.shopCards) {
-      const ok = !full && this.gold >= cost && this.phase === 'play';
-      c.bg.setAlpha(ok ? 1 : 0.5);
-      c.cost.setText(full ? 'FULL' : `${cost} g`);
-      c.cost.setColor(ok ? UI.gold : '#a06060');
-    }
-
-    // selection
-    if (this.selected && !this.tower.blocks.includes(this.selected)) this.selected = null;
-    const s = this.selected;
-    this.selPanel.forEach((o) => o.setVisible(!!s && !this.dragging));
-    this.hintText.setVisible(!s || this.dragging);
-    if (this.dragging && this.dragBlock) this.hintText.setText(`Drop on a floor to move · drop on TRASH to sell for ${this.refund(this.dragBlock)}g`);
-    else this.hintText.setText(this.tower.blocks.length ? 'Tap a block to upgrade · drag blocks to reorder' : 'Buy a weapon block below to start building');
-    if (s) {
-      const idx = this.tower.blocks.indexOf(s) + 1;
-      this.selText.setText(`Floor ${idx} · ${WEAPONS[s.weapon].name}\nHP ${Math.ceil(s.hp)}/${Math.round(s.maxHp)}  (HP lv ${s.hpLevel})`);
-      const uc = this.tower.hpUpgradeCost(s);
-      this.selBtnText.setText(`+HP  ${uc} g`);
-      this.selBtn.setFillStyle(this.gold >= uc ? 0x2f7d4f : 0x4a4f5a);
-    }
+  worldToScreen(x: number, y: number): { x: number; y: number } {
+    const cam = this.cameras.main;
+    return { x: (x - cam.worldView.x) * cam.zoom, y: (y - cam.worldView.y) * cam.zoom };
   }
 
   // ---------------------------------------------------------------- input
 
   setupInput(): void {
     this.input.on('pointerdown', (p: Phaser.Input.Pointer, over: Phaser.GameObjects.GameObject[]) => {
-      // hidden tuning panel: triple-tap top-left corner
-      if (p.x < TRIPLE_TAP_ZONE.w && p.y < TRIPLE_TAP_ZONE.h) {
-        const now = this.time.now;
-        this.tapTimes = this.tapTimes.filter((t) => now - t < 700);
-        this.tapTimes.push(now);
-        if (this.tapTimes.length >= 3) {
-          this.tapTimes = [];
-          this.openTuningPanel();
-          return;
-        }
-      }
-      if (this.phase !== 'play') return;
       const blockObj = over.find((o) => o.getData && o.getData('block'));
-      if (blockObj) {
-        this.dragBlock = blockObj.getData('block') as Block;
-        this.dragPointer = p;
-        this.dragStart = { x: p.x, y: p.y };
-        this.dragging = false;
+      if (this.mode === 'build') {
+        if (blockObj) {
+          this.dragBlock = blockObj.getData('block') as Block;
+          this.dragPointer = p;
+          this.dragStart = { x: p.x, y: p.y };
+          this.dragging = false;
+        }
         return;
       }
-      if (over.length > 0) return; // HUD button
-      if (p.y < this.groundY + 40 && !this.aimPointer) this.aimPointer = p;
+      if (this.mode !== 'battle') return;
+      if (blockObj && !this.aimPointer) {
+        // tapping the tower opens build mode (game pauses)
+        this.enterBuild();
+        return;
+      }
+      if (over.length === 0 && !this.aimPointer) this.aimPointer = p;
     });
 
     this.input.on('pointermove', (p: Phaser.Input.Pointer) => {
       if (p !== this.dragPointer || !this.dragBlock) return;
-      if (!this.dragging && Phaser.Math.Distance.Between(p.x, p.y, this.dragStart.x, this.dragStart.y) > 12) {
+      if (!this.dragging && Phaser.Math.Distance.Between(p.x, p.y, this.dragStart.x, this.dragStart.y) > 10) {
         this.dragging = true;
-        this.selected = null;
         this.dragBlock.container.setDepth(60);
+        this.clearPanels();
       }
       if (this.dragging) {
         this.dragIndex = this.dropIndexAt(p.worldY);
@@ -394,197 +235,355 @@ export class GameScene extends Phaser.Scene {
           const blocks = this.tower.blocks;
           blocks.splice(blocks.indexOf(b), 1);
           blocks.splice(this.dragIndex, 0, b);
-          b.visY = Math.min(b.visY, this.tower.slotY(this.dragIndex));
         }
-      } else if (this.phase === 'play') {
-        this.selected = this.selected === b ? null : b;
       }
       this.dragBlock = null;
       this.dragPointer = null;
       this.dragging = false;
+      this.panelsKey = '';
     };
     this.input.on('pointerup', release);
     this.input.on('pointerupoutside', release);
   }
 
   dropIndexAt(worldY: number): number {
-    const n = this.tower.blocks.length;
     const i = Math.floor((this.groundY - CFG.tower.cartHeight - worldY) / this.tower.bh);
-    return Phaser.Math.Clamp(i, 0, n - 1);
+    return Phaser.Math.Clamp(i, 0, this.tower.blocks.length - 1);
   }
 
   isOverTrash(p: Phaser.Input.Pointer): boolean {
-    return Math.abs(p.x - this.trash.x) < 52 && Math.abs(p.y - this.trash.y) < 52;
+    return p.x < 120 && p.y > 110 && p.y < 230;
   }
 
-  openTuningPanel(): void {
-    this.scene.pause();
+  // ---------------------------------------------------------------- modes & economy
+
+  enterBuild(): void {
+    if (this.mode !== 'battle') return;
+    this.mode = 'build';
     this.aimPointer = null;
-    openTuning(
-      () => { this.scene.resume(); this.scene.restart(); },
-      () => this.scene.resume(),
-    );
+    this.panelsKey = '';
   }
 
-  // ---------------------------------------------------------------- economy
-
-  refund(b: Block): number {
-    return Math.floor(b.spent * CFG.tower.sellRefund);
+  startBattle(): void {
+    if (this.mode !== 'build') return;
+    if (!this.tower.blocks.some((b) => b.weapon)) {
+      this.hud.toast('Buy a weapon first!');
+      return;
+    }
+    this.mode = 'battle';
+    this.started = true;
+    this.clearPanels();
   }
 
-  buyBlock(w: WeaponId): void {
-    if (this.phase !== 'play') return;
-    const cost = this.tower.blockCost();
-    if (this.tower.blocks.length >= CFG.tower.maxBlocks) return this.toast('Tower is full (6 blocks)');
-    if (this.gold < cost) return this.toast('Not enough gold');
+  spend(cost: number): boolean {
+    if (this.gold < cost) {
+      this.hud.toast('Not enough gold');
+      return false;
+    }
     this.gold -= cost;
-    this.tower.addBlock(w, cost);
+    this.panelsKey = '';
+    return true;
+  }
+
+  buyBlock(): void {
+    if (this.tower.blocks.length >= CFG.tower.maxBlocks) return this.hud.toast('Tower is full');
+    const cost = this.tower.blockCost();
+    if (!this.spend(cost)) return;
+    this.tower.addBlock(cost);
+  }
+
+  buyWeapon(b: Block, w: WeaponId): void {
+    const cost = CFG.weapons[w].price;
+    if (!this.spend(cost)) return;
+    this.tower.setWeapon(b, w, cost);
+  }
+
+  weaponUpgradeCost(b: Block): number {
+    return CFG.weaponLevel.upgradeCostStep * b.level;
+  }
+
+  upgradeWeapon(b: Block): void {
+    const cost = this.weaponUpgradeCost(b);
+    if (!this.spend(cost)) return;
+    b.level++;
+    b.weaponSpent += cost;
+  }
+
+  sellWeapon(b: Block): void {
+    const r = Math.floor(b.weaponSpent * CFG.weaponLevel.sellRefund);
+    this.gold += r;
+    this.tower.setWeapon(b, null, 0);
+    this.panelsKey = '';
+  }
+
+  upgradeBlockHp(b: Block): void {
+    const cost = this.tower.hpUpgradeCost(b);
+    if (!this.spend(cost)) return;
+    this.tower.upgradeHp(b, cost);
+  }
+
+  upgradeRegen(): void {
+    if (!this.spend(this.regenCost)) return;
+    this.regenLevel++;
+  }
+
+  blockRefund(b: Block): number {
+    return Math.floor(b.blockSpent * CFG.tower.blockSellRefund + b.weaponSpent * CFG.weaponLevel.sellRefund);
   }
 
   sellBlock(b: Block): void {
-    const r = this.refund(b);
-    this.gold += r;
-    this.floatText(this.trash.x + this.cameras.main.scrollX, this.trash.y + 40, `+${r}g`, UI.gold);
-    if (this.selected === b) this.selected = null;
+    if (this.tower.blocks.length <= 1) {
+      this.hud.toast('Keep at least one block');
+      return;
+    }
+    this.gold += this.blockRefund(b);
     this.tower.removeBlock(b);
+    this.panelsKey = '';
   }
 
-  upgradeSelected(): void {
-    const s = this.selected;
-    if (!s || this.phase !== 'play') return;
-    const cost = this.tower.hpUpgradeCost(s);
-    if (this.gold < cost) return this.toast('Not enough gold');
-    this.gold -= cost;
-    this.tower.upgradeHp(s, cost);
+  ownedTypes(): WeaponId[] {
+    const set = new Set<WeaponId>();
+    for (const b of this.tower.blocks) if (b.weapon) set.add(b.weapon);
+    return this.offered.filter((w) => set.has(w));
+  }
+
+  useAbility(w: WeaponId): void {
+    if (this.mode !== 'battle') return;
+    const ab = CFG.abilities[w];
+    if (this.energy < ab.cost) return this.hud.toast('Not enough energy');
+    const blocks = this.tower.blocks.filter((b) => b.weapon === w);
+    if (!blocks.length) return;
+    this.energy -= ab.cost;
+    const a = CFG.abilities;
+    switch (w) {
+      case 'saw': this.abilityTime.saw = a.saw.duration; break;
+      case 'flame': this.abilityTime.flame = a.flame.duration; break;
+      case 'laser': this.abilityTime.laser = a.laser.duration; break;
+      case 'mg': this.abilityTime.mg = a.mg.duration; break;
+      case 'shocker':
+        for (const b of blocks) {
+          const m = this.tower.muzzle(b);
+          this.fx.push({ kind: 'ring', x1: m.x, y1: m.y, x2: 0, y2: 0, width: 8, color: 0xfff27a, life: 0.4, maxLife: 0.4, radius: a.shocker.radius, grow: true });
+          for (const t of this.targets()) {
+            if (Math.hypot(t.x - m.x, t.y - m.y) > a.shocker.radius) continue;
+            t.hit(weaponDamage(b, a.shocker.damage));
+            if (t instanceof Zombie) t.freeze(a.shocker.stun);
+            if (Math.random() < 0.5) this.fx.push({ kind: 'bolt', x1: m.x, y1: m.y, x2: t.x, y2: t.y, width: 3, color: 0xfff27a, life: 0.2, maxLife: 0.2 });
+          }
+        }
+        this.cameras.main.flash(120, 255, 250, 180);
+        break;
+      case 'rocket':
+        for (const b of blocks) this.rocketJobs.push({ block: b, left: a.rocket.count, timer: 0 });
+        break;
+      case 'cryo':
+        for (const t of this.targets()) {
+          if (Math.abs(t.x - this.tower.x) > a.cryo.radius) continue;
+          t.hit(a.cryo.damage);
+          if (t instanceof Zombie) t.freeze(a.cryo.freezeTime);
+          this.parts.burst(t.x, t.y, 3, 60, 0.4, 0.3, 0.6, [0xffffff, 0x9fe3ff], {});
+        }
+        this.cameras.main.flash(200, 190, 240, 255);
+        break;
+      case 'boomerang':
+        for (const b of blocks) {
+          const m = this.tower.muzzle(b);
+          for (let k = 0; k < a.boomerang.count; k++) fireBoomerang(this, b, m.x + 30, m.y, -0.35 + (0.7 * k) / Math.max(1, a.boomerang.count - 1), true);
+        }
+        break;
+    }
+  }
+
+  useGrenade(): void {
+    if (this.mode !== 'battle') return;
+    const c = CFG.grenade;
+    if (this.energy < c.cost) return this.hud.toast('Not enough energy');
+    const hx = this.hero.x;
+    const hy = this.hero.y - 30;
+    let tx: number;
+    let ty: number;
+    if (this.aimPointer) {
+      tx = this.aimPointer.worldX;
+      ty = Math.min(this.aimPointer.worldY, this.groundY - 10);
+    } else {
+      // aim at the densest group in range
+      let best: Target | null = null;
+      let bestN = 0;
+      const ts = this.targets();
+      for (const t of ts) {
+        if (t.x < this.tower.frontX || t.x - hx > 520) continue;
+        const n = ts.filter((o) => Math.abs(o.x - t.x) < c.radius && Math.abs(o.y - t.y) < c.radius).length;
+        if (n > bestN) { bestN = n; best = t; }
+      }
+      if (!best) return this.hud.toast('No targets');
+      tx = best.x;
+      ty = best.y;
+    }
+    this.energy -= c.cost;
+    throwGrenade(this, hx, hy, tx, ty);
   }
 
   onEnemyKilled(t: Target, gold: number): void {
     this.gold += gold;
     this.kills++;
-    this.floatText(t.x, t.y - t.h / 2 - 10, `+${gold}`, UI.gold);
+    const s = this.worldToScreen(t.x, t.y);
+    const coins = t instanceof Nest ? 8 : 1;
+    for (let i = 0; i < coins; i++) this.time.delayedCall(i * 60, () => this.hud.flyCoin(s.x + (Math.random() - 0.5) * 40, s.y));
     if (t instanceof Nest) {
-      this.cameras.main.shake(200, 0.006);
-      this.banner('Nest destroyed!');
+      explode(this, t.x, t.y, 90, 0);
+      this.cameras.main.shake(250, 0.008);
+      t.wreck();
+      this.hud.banner('Nest destroyed!');
+    } else {
+      this.parts.burst(t.x, t.y, 6, 140, 0.35, 0.4, 0.9, [0xb6e36a, 0x7fb03a], { grav: 300, up: 80 });
     }
+    this.panelsKey = '';
   }
 
-  // ---------------------------------------------------------------- feedback
+  // ---------------------------------------------------------------- build panels (world-anchored)
 
-  floatText(x: number, y: number, s: string, color: string): void {
-    const t = this.add.text(x, y, s, { fontFamily: UI.font, fontSize: '16px', color, fontStyle: 'bold', stroke: '#000', strokeThickness: 3 })
-      .setOrigin(0.5).setDepth(50);
-    this.tweens.add({ targets: t, y: y - 40, alpha: 0, duration: 800, onComplete: () => t.destroy() });
+  clearPanels(): void {
+    this.panels.forEach((o) => o.destroy());
+    this.panels = [];
   }
 
-  toast(s: string): void {
-    const t = this.text(this.W / 2, this.groundY + 20, s, 16, '#ffdddd').setOrigin(0.5).setDepth(120)
-      .setBackgroundColor('#00000099').setPadding(10, 6, 10, 6);
-    this.tweens.add({ targets: t, alpha: 0, delay: 700, duration: 400, onComplete: () => t.destroy() });
-  }
-
-  banner(s: string): void {
-    const t = this.text(this.W / 2, this.H * 0.22, s, 30, '#ffffff').setOrigin(0.5).setDepth(120)
-      .setStroke('#000', 6);
-    this.tweens.add({ targets: t, y: t.y - 30, alpha: 0, delay: 900, duration: 600, onComplete: () => t.destroy() });
-  }
-
-  // ---------------------------------------------------------------- overlays
-
-  makeOverlay(): Phaser.GameObjects.Container {
-    this.overlay?.destroy();
-    const shade = this.add.rectangle(this.W / 2, this.H / 2, this.W, this.H, 0x000000, 0.7).setInteractive();
-    const c = this.add.container(0, 0, [shade]).setScrollFactor(0, 0, true).setDepth(1000);
-    this.overlay = c;
-    return c;
-  }
-
-  overlayText(c: Phaser.GameObjects.Container, x: number, y: number, s: string, size: number, color = UI.text): Phaser.GameObjects.Text {
-    const t = this.add.text(x, y, s, { fontFamily: UI.font, fontSize: `${size}px`, color, fontStyle: 'bold', align: 'center' })
-      .setOrigin(0.5).setScrollFactor(0);
-    c.add(t);
-    return t;
-  }
-
-  overlayButton(c: Phaser.GameObjects.Container, y: number, label: string, onTap: () => void): void {
-    const b = this.add.rectangle(this.W / 2, y, 260, 64, 0x2f7d4f).setStrokeStyle(3, 0x1d4a30).setScrollFactor(0).setInteractive();
-    b.on('pointerdown', onTap);
-    c.add(b);
-    this.overlayText(c, this.W / 2, y, label, 24);
-  }
-
-  showIntro(): void {
-    const c = this.makeOverlay();
-    const top = this.H * 0.16;
-    this.overlayText(c, this.W / 2, top, 'STACKWAGON', 40, '#ffd166');
-    this.overlayText(c, this.W / 2, top + 44, 'Stage 1 · Ruined City', 20, UI.dim);
-    this.overlayText(c, this.W / 2, top + 100, 'Weapons for this stage', 18);
-    this.offered.forEach((w, i) => {
-      const m = WEAPONS[w];
-      const y = top + 150 + i * 92;
-      const r = this.add.rectangle(this.W / 2, y + 18, this.W - 60, 82, UI.panelLight).setStrokeStyle(3, m.color).setScrollFactor(0);
-      c.add(r);
-      this.overlayText(c, this.W / 2, y, `${m.name}  ·  ${m.reach} range${m.hitsAir ? '  ·  hits air' : ''}`, 18);
-      this.overlayText(c, this.W / 2, y + 30, m.desc, 14, UI.dim);
-    });
-    const tips = [
-      'Your wagon rolls right on its own. Reach END to win.',
-      'Short range low, long range high. Destroy nests to pass.',
-      'Hold anywhere above the ground to aim the hero\'s shotgun.',
-    ];
-    this.overlayText(c, this.W / 2, top + 440, tips.join('\n'), 14, UI.text).setLineSpacing(6);
-    this.overlayButton(c, Math.min(this.H - 90, top + 540), 'START', () => {
-      this.overlay?.destroy();
-      this.overlay = null;
-      this.phase = 'play';
-    });
-  }
-
-  endStage(won: boolean): void {
-    if (this.phase !== 'play') return;
-    this.phase = won ? 'won' : 'lost';
-    this.aimPointer = null;
-    this.dragBlock = null;
-    this.dragging = false;
-    this.time.delayedCall(won ? 400 : 900, () => {
-      const c = this.makeOverlay();
-      const top = this.H * 0.3;
-      this.overlayText(c, this.W / 2, top, won ? 'STAGE CLEAR!' : 'WAGON DOWN', 42, won ? '#9be89b' : '#ff8080');
-      const prog = Math.round(Phaser.Math.Clamp((this.tower.x - START_X) / CFG.stage.length, 0, 1) * 100);
-      this.overlayText(c, this.W / 2, top + 140,
-        `Progress ${prog}%\nZombies defeated ${this.kills}\nNests destroyed ${this.nests.filter((n) => !n.alive).length}/${this.nests.length}\nGold left ${Math.floor(this.gold)}`,
-        18, UI.text).setLineSpacing(8);
-      this.overlayButton(c, top + 290, won ? 'PLAY AGAIN' : 'RETRY', () => this.scene.restart());
+  refreshPanels(): void {
+    const key = this.mode === 'build' && !this.dragging
+      ? JSON.stringify([Math.floor(this.gold), this.tower.blocks.map((b) => [b.weapon, b.level, b.hpLevel, Math.round(b.visY)])])
+      : '';
+    if (key === this.panelsKey) return;
+    this.panelsKey = key;
+    this.clearPanels();
+    if (!key) return;
+    const t = this.tower;
+    const add = <T extends Phaser.GameObjects.GameObject>(o: T): T => {
+      this.panels.push(o);
+      return o;
+    };
+    const coinCost = (c: Phaser.GameObjects.Container, y: number, cost: number | string, x = 0) => {
+      c.add(this.add.image(x - 20, y, 'coin').setScale(0.55));
+      c.add(txt(this, x + 6, y, `${cost}`, 15, '#ffffff', 4));
+    };
+    t.blocks.forEach((b) => {
+      const y = t.slotY(t.blocks.indexOf(b));
+      // HP card (left)
+      const hpCost = t.hpUpgradeCost(b);
+      const hp = add(button(this, t.x - t.bw / 2 - 44, y, 70, 52, 0x8c97a8, () => this.upgradeBlockHp(b)));
+      hp.setDepth(45);
+      hp.add(txt(this, -20, -16, `Lv${b.hpLevel}`, 12, '#ffffff', 3).setOrigin(0, 0.5));
+      hp.add(txt(this, 0, -2, `HP ${Math.round(b.maxHp)}`, 13, '#ffffff', 3));
+      coinCost(hp, 15, hpCost, 2);
+      hp.setEnabled(this.gold >= hpCost);
+      // weapon side (right)
+      const x0 = t.x + t.bw / 2 + 50;
+      if (!b.weapon) {
+        this.offered.forEach((w, k) => {
+          const price = CFG.weapons[w].price;
+          const btn = add(button(this, x0 + k * 64, y, 58, 52, 0x4aa3f0, () => this.buyWeapon(b, w)));
+          btn.setDepth(45);
+          const icon = this.add.image(0, -8, WEAPONS[w].icon);
+          icon.setScale(Math.min(42 / icon.width, 26 / icon.height));
+          btn.add(icon);
+          btn.add(this.add.image(-16, 14, 'coin').setScale(0.45));
+          btn.add(txt(this, 6, 14, `${price}`, 14, '#ffffff', 4));
+          btn.setEnabled(this.gold >= price);
+        });
+      } else {
+        const cost = this.weaponUpgradeCost(b);
+        const lv = add(button(this, x0 + 30, y, 116, 52, 0x4aa3f0, () => this.upgradeWeapon(b)));
+        lv.setDepth(45);
+        const g = this.add.graphics();
+        const pips = 6;
+        const filled = ((b.level - 1) % pips) + 1;
+        for (let i = 0; i < pips; i++) {
+          g.fillStyle(i < filled ? 0x2a5fb0 : 0x9ccaf5, 1);
+          g.fillRoundedRect(-50 + i * 17, -23, 14, 6, 2);
+        }
+        lv.add(g);
+        const dmg = (CFG.weapons[b.weapon] as { damage: number }).damage;
+        lv.add(txt(this, 0, -7, `Lv${b.level} Damage ${fmt(weaponDamage(b, dmg))}`, 13, '#ffffff', 3));
+        const band = this.add.graphics();
+        band.fillStyle(0x5cc35a, 1);
+        band.fillRoundedRect(-54, 5, 108, 18, 5);
+        lv.add(band);
+        coinCost(lv, 14, cost);
+        lv.setEnabled(this.gold >= cost);
+        const sellValue = Math.floor(b.weaponSpent * CFG.weaponLevel.sellRefund);
+        const sell = add(button(this, x0 + 134, y, 76, 52, 0x4aa3f0, () => this.sellWeapon(b)));
+        sell.setDepth(45);
+        sell.add(txt(this, 0, -9, 'SELL', 17, '#ffffff', 4));
+        const band2 = this.add.graphics();
+        band2.fillStyle(0x5cc35a, 1);
+        band2.fillRoundedRect(-34, 5, 68, 18, 5);
+        sell.add(band2);
+        coinCost(sell, 14, sellValue);
+      }
     });
   }
 
   // ---------------------------------------------------------------- loop
 
   update(_time: number, deltaMs: number): void {
-    const dt = Math.min(0.05, deltaMs / 1000) * (this.phase === 'play' ? this.speedMult : 1);
+    const realDt = Math.min(0.05, deltaMs / 1000);
+    const dt = realDt * (this.mode === 'battle' ? this.speedMult : 0);
     this.gWorld.clear();
-    if (this.phase === 'play') {
-      this.elapsed += dt;
+    if (this.mode === 'battle') {
+      this.energy = Math.min(CFG.energy.max, this.energy + this.regen * dt);
+      for (const w of WEAPON_IDS) this.abilityTime[w] = Math.max(0, this.abilityTime[w] - dt);
       this.updateSpawns(dt);
       this.updateNests(dt);
-      this.updateTowerMovement(dt);
+      const moved = this.updateTowerMovement(dt);
+      this.tower.update(dt, moved, null, 0);
       this.updateZombies(dt);
       this.updateHero(dt);
-      for (const b of this.tower.blocks) {
-        if (b === this.dragBlock && this.dragging) continue;
-        updateWeapon(this, b, dt);
-      }
+      for (const b of this.tower.blocks) updateWeapon(this, b, dt);
+      this.updateRocketJobs(dt);
       updateProjectiles(this, dt, this.groundY);
       this.cleanupDead();
       this.checkProgress();
+    } else {
+      this.tower.update(realDt, 0, this.dragging ? this.dragBlock : null, this.dragIndex);
     }
-    this.tower.update(dt, this.phase === 'play' ? 1 : 0, this.dragging ? this.dragBlock : null, this.dragIndex);
-    this.positionHero(dt);
+    this.parts.update(this.mode === 'battle' ? dt : realDt * 0.0);
+    this.positionHero(realDt);
     this.zombies.forEach((z) => z.draw());
     this.nests.forEach((n) => n.draw(dt));
-    this.drawWorldOverlays();
+    this.drawOverlays();
     drawFx(this.gWorld, this.fx, dt);
-    this.cameras.main.scrollX = this.tower.x - 150;
-    this.drawHud();
+    this.popNumbers(dt);
+    this.updateCamera(Math.min(1, realDt * 4));
+    this.refreshPanels();
+  }
+
+  updateRocketJobs(dt: number): void {
+    const a = CFG.abilities.rocket;
+    for (const j of this.rocketJobs) {
+      j.timer -= dt;
+      if (j.timer > 0 || j.left <= 0) continue;
+      j.timer = 0.12;
+      j.left--;
+      if (!this.tower.blocks.includes(j.block)) { j.left = 0; continue; }
+      const ts = this.targets().filter((t) => !t.isAir && t.x > this.tower.frontX && t.x - this.tower.x < 700);
+      const t = ts.length ? Phaser.Utils.Array.GetRandom(ts) as Target : null;
+      const m = this.tower.muzzle(j.block);
+      const tx = t ? t.x : this.tower.frontX + 200 + Math.random() * 300;
+      fireRocket(this, m.x + 20, m.y - 10, tx, t ? t.y : this.groundY - 20, weaponDamage(j.block, a.damage), a.splash);
+    }
+    this.rocketJobs = this.rocketJobs.filter((j) => j.left > 0);
+  }
+
+  popNumbers(dt: number): void {
+    for (const t of this.targets().concat(this.zombies.filter((z) => !z.alive) as Target[])) {
+      t.numTimer -= dt;
+      if (t.dmgAcc <= 0 || t.numTimer > 0) continue;
+      t.numTimer = 0.28;
+      const n = Math.max(1, Math.round(t.dmgAcc));
+      t.dmgAcc = 0;
+      const big = n >= 20;
+      const label = txt(this, t.x + (Math.random() - 0.5) * 20, t.y - t.h / 2 - 8, fmt(n), big ? 20 : 15, big ? '#ffd23a' : '#ffffff', 4).setDepth(50);
+      this.tweens.add({ targets: label, y: label.y - 26, duration: 500, ease: 'Cubic.out' });
+      this.tweens.add({ targets: label, alpha: 0, delay: 350, duration: 250, onComplete: () => label.destroy() });
+    }
   }
 
   updateSpawns(dt: number): void {
@@ -593,8 +592,9 @@ export class GameScene extends Phaser.Scene {
     if (this.spawnTimer > 0) return;
     this.spawnTimer = s.interval * Math.pow(s.intervalFactorPerSection, this.section) * (0.7 + Math.random() * 0.6);
     if (this.zombies.length >= s.maxAlive) return;
+    if (this.tower.x > this.finishX - 300) return;
     const n = Phaser.Math.Between(s.groupMin, s.groupMax);
-    const baseX = this.cameras.main.scrollX + this.W + 40;
+    const baseX = this.cameras.main.worldView.right + 40;
     for (let i = 0; i < n; i++) {
       const r = Math.random();
       let kind: EnemyId = 'walker';
@@ -603,56 +603,59 @@ export class GameScene extends Phaser.Scene {
       else if (r < s.flyerChance + s.bruteChance + s.runnerChance) kind = 'runner';
       else if (r < s.flyerChance + s.bruteChance + s.runnerChance + s.climberChance) kind = 'climber';
       const alt = kind === 'flyer' ? Phaser.Math.Between(s.flyerAltMin, s.flyerAltMax) : 0;
-      this.zombies.push(new Zombie(this, kind, baseX + i * 36, alt, this.hpMult(), this.dmgMult()));
+      this.zombies.push(new Zombie(this, kind, baseX + i * 34, alt, this.hpMult(), this.dmgMult()));
     }
   }
 
   updateNests(dt: number): void {
     const c = CFG.nest;
     for (const n of this.nests) {
-      if (!n.alive) continue;
-      if (n.x - this.tower.frontX > c.activationRange) continue;
+      if (!n.alive || n.x - this.tower.frontX > c.activationRange) continue;
       n.spawnTimer -= dt;
       if (n.spawnTimer > 0 || this.zombies.length >= CFG.spawns.maxAlive) continue;
       n.spawnTimer = c.spawnInterval;
       const r = Math.random();
       const kind: EnemyId = r < c.runnerChance ? 'runner' : r < c.runnerChance + c.climberChance ? 'climber' : 'walker';
-      this.zombies.push(new Zombie(this, kind, n.x - n.w / 2 - 14, 0, this.hpMult(), this.dmgMult()));
+      const z = new Zombie(this, kind, n.x - 30, 0, this.hpMult(), this.dmgMult());
+      this.zombies.push(z);
+      n.door.setRotation(-0.5);
+      this.time.delayedCall(200, () => n.door.active && n.alive && n.door.setRotation(-0.12));
     }
   }
 
-  updateTowerMovement(dt: number): void {
+  updateTowerMovement(dt: number): number {
     const t = this.tower;
     const front = t.frontX;
-    const touching = this.zombies.some((z) => !z.isAir && z.attacking);
+    const touching = this.zombies.some((z) => !z.isAir && z.attacking && z.alive);
     let limit = Infinity;
     for (const n of this.nests) if (n.alive && n.x > front - 20) limit = Math.min(limit, n.x - n.w / 2 - CFG.nest.blockGap);
     let speed = CFG.tower.cartSpeed;
     if (touching) speed = 0;
-    else if (this.zombies.some((z) => !z.isAir && z.x - z.w / 2 - front < CFG.tower.slowDistance)) speed *= CFG.tower.slowSpeedFactor;
+    else if (this.zombies.some((z) => !z.isAir && z.alive && z.x - z.w / 2 - front < CFG.tower.slowDistance)) speed *= CFG.tower.slowSpeedFactor;
     const newFront = Math.min(front + speed * dt, Math.max(front, limit));
-    t.x += newFront - front;
+    const moved = newFront - front;
+    t.x += moved;
 
     for (const c of this.crates) {
-      if (c.taken || t.frontX < c.x - 22) continue;
+      if (c.taken || t.frontX < c.x - 20) continue;
       c.taken = true;
-      c.destroy();
+      this.tweens.add({ targets: c.sprite, y: c.sprite.y - 60, alpha: 0, duration: 300, onComplete: () => c.sprite.destroy() });
       if (t.blocks.length < CFG.tower.maxBlocks) {
-        const w = Phaser.Utils.Array.GetRandom(this.offered) as WeaponId;
-        t.addBlock(w, 0);
-        this.banner(`Free ${WEAPONS[w].name} block!`);
+        t.addBlock(0);
+        this.hud.banner('Free block!');
       } else {
         this.gold += CFG.stage.crateGoldIfFull;
-        this.banner(`Crate: +${CFG.stage.crateGoldIfFull} gold`);
+        this.hud.banner(`+${CFG.stage.crateGoldIfFull} gold`);
       }
     }
+    return moved;
   }
 
   updateZombies(dt: number): void {
     const t = this.tower;
     const ph = CFG.physics;
     const front = t.frontX;
-    const ground = this.zombies.filter((z) => !z.isAir).sort((a, b) => a.x - b.x);
+    const ground = this.zombies.filter((z) => !z.isAir && z.alive).sort((a, b) => a.x - b.x);
 
     for (const z of ground) {
       z.tickStatus(dt);
@@ -660,17 +663,14 @@ export class GameScene extends Phaser.Scene {
       let nx = z.x - z.speed * mult * dt;
       let blocker: Zombie | null = null;
       z.attacking = false;
-
-      // the tower face
       if (nx - z.w / 2 < front) {
         nx = front + z.w / 2;
         z.attacking = true;
       }
-      // zombies ahead at the same height block the way
       for (const o of ground) {
         if (o === z || o.x >= z.x) continue;
-        if (o.top <= z.alt + ph.stepUp) continue; // below our feet: it's floor
-        if (o.alt >= z.top - ph.stepUp) continue; // above our head
+        if (o.top <= z.alt + ph.stepUp) continue;
+        if (o.alt >= z.top - ph.stepUp) continue;
         const minX = o.x + ((o.w + z.w) / 2) * ph.crowdOverlap;
         if (nx < minX) {
           nx = Math.max(Math.min(minX, z.x), nx);
@@ -681,46 +681,39 @@ export class GameScene extends Phaser.Scene {
       z.blocked = z.attacking || !!blocker;
       z.x = nx;
 
-      // climbing over a stuck zombie
       z.climbing = false;
       if (blocker && blocker.blocked && z.climbSpeed > 0 && mult > 0 && !z.attacking) {
         z.alt = Math.min(blocker.top, z.alt + z.climbSpeed * mult * dt);
         z.climbing = true;
       }
-      // standing on others / falling
       let floor = 0;
       for (const o of ground) {
         if (o === z) continue;
         if (Math.abs(o.x - z.x) > ((o.w + z.w) / 2) * 0.6) continue;
         if (o.top <= z.alt + ph.stepUp) floor = Math.max(floor, o.top);
       }
-      if (!z.climbing) {
-        if (z.alt > floor) z.alt = Math.max(floor, z.alt - ph.fallSpeed * dt);
-        else z.alt = floor;
-      }
+      if (!z.climbing) z.alt = z.alt > floor ? Math.max(floor, z.alt - ph.fallSpeed * dt) : floor;
 
-      // attack
       if (z.attacking && mult > 0) {
         z.attackTimer -= dt * mult;
         if (z.attackTimer <= 0) {
           z.attackTimer = z.attackInterval;
-          z.lunge = 0.12;
+          z.lunge = 0.15;
           this.zombieHitsTower(z, z.alt + z.h * 0.5);
         }
       }
     }
 
-    // flyers go for the hero
     for (const z of this.zombies) {
-      if (!z.isAir) continue;
+      if (!z.isAir || !z.alive) continue;
       z.tickStatus(dt);
       const mult = z.speedMult;
-      const tx = t.x + 50;
-      const targetAlt = this.groundY - (t.visTopY - 30) - z.h / 2;
+      const tx = t.x + 46;
+      const targetAlt = this.groundY - (t.visTopY - 40);
       const dx = tx - z.x;
       const da = targetAlt - z.alt;
-      const d = Math.hypot(dx, da);
-      z.attacking = d < 16;
+      const d = Math.hypot(dx, da) || 1;
+      z.attacking = d < 14;
       if (!z.attacking) {
         const step = Math.min(d, z.speed * mult * dt);
         z.x += (dx / d) * step;
@@ -729,7 +722,7 @@ export class GameScene extends Phaser.Scene {
         z.attackTimer -= dt * mult;
         if (z.attackTimer <= 0) {
           z.attackTimer = z.attackInterval;
-          z.lunge = 0.12;
+          z.lunge = 0.15;
           this.damageHero(z.damage);
         }
       }
@@ -738,19 +731,16 @@ export class GameScene extends Phaser.Scene {
 
   zombieHitsTower(z: Zombie, alt: number): void {
     const idx = this.tower.blockIndexAtAlt(alt);
-    if (idx < 0) {
-      this.damageHero(z.damage);
-      return;
-    }
+    if (idx < 0) return this.damageHero(z.damage);
     const b = this.tower.blocks[idx];
     b.hp -= z.damage;
     b.flash = 0.1;
+    b.hitShow = 2;
     if (b.hp <= 0) {
-      this.fx.push({ kind: 'ring', x1: this.tower.x, y1: b.visY, x2: 0, y2: 0, width: 6, color: 0xff7040, life: 0.35, maxLife: 0.35, radius: 60 });
-      this.cameras.main.shake(150, 0.005);
-      if (this.selected === b) this.selected = null;
-      if (this.dragBlock === b) { this.dragBlock = null; this.dragging = false; }
+      this.parts.burst(this.tower.x, b.visY, 14, 220, 0.6, 0.5, 1.2, [0xb8693e, 0x8f4a2a, 0x6a5a55], { grav: 500, up: 100 });
+      this.cameras.main.shake(180, 0.006);
       this.tower.removeBlock(b);
+      if (this.tower.blocks.length === 0) this.hud.toast('Tower destroyed!');
     }
   }
 
@@ -766,22 +756,23 @@ export class GameScene extends Phaser.Scene {
   updateHero(dt: number): void {
     this.heroCooldown -= dt;
     this.heroFlash = Math.max(0, this.heroFlash - dt);
-    const gx = this.hero.x;
-    const gy = this.hero.y - 2;
+    const gx = this.hero.x + 4;
+    const gy = this.hero.y - 22;
     if (this.aimPointer) {
       this.heroAngle = Math.atan2(this.aimPointer.worldY - gy, this.aimPointer.worldX - gx);
       if (this.heroCooldown <= 0) {
         this.heroCooldown = CFG.hero.aimFireInterval;
-        fireHero(this, gx, gy, this.heroAngle);
+        fireHero(this, gx + Math.cos(this.heroAngle) * 30, gy + Math.sin(this.heroAngle) * 30, this.heroAngle);
       }
       return;
     }
     const target = nearestTarget(this, gx, gy, CFG.hero.range, true);
     if (target) {
-      this.heroAngle = Phaser.Math.Angle.RotateTo(this.heroAngle, Math.atan2(target.y - gy, target.x - gx), dt * 10);
+      const want = Math.atan2(target.y - gy, target.x - gx);
+      this.heroAngle = Phaser.Math.Angle.RotateTo(this.heroAngle, want, dt * 10);
       if (this.heroCooldown <= 0) {
         this.heroCooldown = CFG.hero.fireInterval;
-        fireHero(this, gx, gy, Math.atan2(target.y - gy, target.x - gx));
+        fireHero(this, gx + Math.cos(want) * 30, gy + Math.sin(want) * 30, want);
       }
     } else {
       this.heroCooldown = Math.max(this.heroCooldown, 0);
@@ -789,73 +780,63 @@ export class GameScene extends Phaser.Scene {
   }
 
   positionHero(dt: number): void {
-    const targetY = this.tower.visTopY - 26;
+    const targetY = this.tower.visTopY;
     if (this.hero.y === 0) this.hero.y = targetY;
     if (this.hero.y < targetY) this.hero.y = Math.min(targetY, this.hero.y + CFG.tower.dropSpeed * dt);
     else this.hero.y = Math.max(targetY, this.hero.y - CFG.tower.dropSpeed * 2 * dt);
-    this.hero.x = this.tower.x - 6;
+    this.hero.x = this.tower.x - 4;
     this.heroGun.rotation = this.heroAngle;
-    (this.hero.list[0] as Phaser.GameObjects.Rectangle).setFillStyle(this.heroFlash > 0 ? 0xffffff : 0x3f6fb5);
+    this.heroGun.setFlipY(Math.abs(this.heroAngle) > Math.PI / 2);
+    if (this.heroFlash > 0) this.heroBody.setTintFill(0xffffff);
+    else this.heroBody.clearTint();
   }
 
-  drawWorldOverlays(): void {
+  drawOverlays(): void {
     const g = this.gWorld;
-    // aim cone
-    if (this.aimPointer && this.phase === 'play') {
-      const half = Phaser.Math.DegToRad(CFG.hero.spreadDeg) / 2;
-      g.fillStyle(0xffe08a, 0.18);
-      g.slice(this.hero.x, this.hero.y - 2, CFG.hero.range, this.heroAngle - half, this.heroAngle + half, false);
+    if (this.aimPointer && this.mode === 'battle') {
+      const half = Phaser.Math.DegToRad(Math.max(CFG.hero.spreadDeg, 8)) / 2 + 0.04;
+      g.fillStyle(0xffffff, 0.16);
+      g.slice(this.hero.x + 4, this.hero.y - 22, CFG.hero.range, this.heroAngle - half, this.heroAngle + half, false);
       g.fillPath();
-      g.lineStyle(2, 0xffe08a, 0.6);
-      g.strokeCircle(this.aimPointer.worldX, this.aimPointer.worldY, 18);
+      g.lineStyle(3, 0xffffff, 0.7);
+      g.strokeCircle(this.aimPointer.worldX, this.aimPointer.worldY, 16);
     }
-    // health bars
     for (const z of this.zombies) {
-      if (z.hp >= z.maxHp) continue;
-      this.hpBar(z.x, z.y - z.h / 2 - 8, z.w, z.hp / z.maxHp, 0xd9534f);
+      if (!z.alive || z.hp >= z.maxHp) continue;
+      const w = 30;
+      const y = z.y - z.h / 2 - 10;
+      g.fillStyle(0x2b2433, 1);
+      g.fillRoundedRect(z.x - w / 2 - 2, y - 2, w + 4, 8, 3);
+      g.fillStyle(0xf07a2a, 1);
+      g.fillRoundedRect(z.x - w / 2, y, w * Math.max(0, z.hp / z.maxHp), 4, 2);
     }
-    for (const n of this.nests) {
-      if (!n.alive) continue;
-      this.hpBar(n.x, n.y - n.h / 2 - 32, n.w, n.hp / n.maxHp, 0xd98a3f, 8);
-    }
+    // block HP: vertical green bar on the left when hurt
     for (const b of this.tower.blocks) {
-      this.hpBar(this.tower.x - 6, b.visY - this.tower.bh / 2 + 7, this.tower.bw - 26, b.hp / b.maxHp, 0x4caf6a, 5);
+      if (b.hp >= b.maxHp && b.hitShow <= 0) continue;
+      const x = this.tower.x - this.tower.bw / 2 - 12;
+      const h = this.tower.bh - 14;
+      const y = b.visY - h / 2;
+      g.fillStyle(0x2b2433, 1);
+      g.fillRoundedRect(x - 4, y - 2, 10, h + 4, 4);
+      g.fillStyle(0x3a3a3a, 1);
+      g.fillRoundedRect(x - 2, y, 6, h, 3);
+      const f = Math.max(0, b.hp / b.maxHp);
+      g.fillStyle(f > 0.35 ? 0x6ad44a : 0xe8453c, 1);
+      g.fillRoundedRect(x - 2, y + h * (1 - f), 6, h * f, 3);
     }
-    // selected block outline
-    if (this.selected) {
-      g.lineStyle(4, 0xffd166, 1);
-      g.strokeRect(this.tower.x - this.tower.bw / 2, this.selected.visY - this.tower.bh / 2, this.tower.bw, this.tower.bh);
-    }
-    // drop target marker while dragging
+    // drop slot while dragging
     if (this.dragging && this.dragBlock) {
-      g.lineStyle(3, 0xffffff, 0.8);
-      g.strokeRect(this.tower.x - this.tower.bw / 2, this.tower.slotY(this.dragIndex) - this.tower.bh / 2, this.tower.bw, this.tower.bh);
+      g.lineStyle(3, 0xffffff, 0.9);
+      g.strokeRoundedRect(this.tower.x - this.tower.bw / 2, this.tower.slotY(this.dragIndex) - this.tower.bh / 2, this.tower.bw, this.tower.bh, 6);
     }
-  }
-
-  hpBar(cx: number, y: number, w: number, frac: number, color: number, h = 5): void {
-    const g = this.gWorld;
-    g.fillStyle(0x000000, 0.6);
-    g.fillRect(cx - w / 2 - 1, y - 1, w + 2, h + 2);
-    g.fillStyle(color);
-    g.fillRect(cx - w / 2, y, w * Phaser.Math.Clamp(frac, 0, 1), h);
   }
 
   cleanupDead(): void {
     for (let i = this.zombies.length - 1; i >= 0; i--) {
       const z = this.zombies[i];
-      // also cull zombies left far behind
-      if (!z.alive || z.x < this.cameras.main.scrollX - 300) {
+      if (!z.alive || z.x < this.cameras.main.worldView.x - 300) {
         z.destroy();
         this.zombies.splice(i, 1);
-      }
-    }
-    for (let i = this.nests.length - 1; i >= 0; i--) {
-      const n = this.nests[i];
-      if (!n.alive && n.rect.active) {
-        n.rect.setFillStyle(0x3a3a3a).setAlpha(0.5);
-        n.rect.setActive(false);
-        n.label.setText('X');
       }
     }
   }
@@ -868,11 +849,25 @@ export class GameScene extends Phaser.Scene {
       const heal = CFG.stage.checkpointHealPct;
       for (const b of this.tower.blocks) b.hp = Math.min(b.maxHp, b.hp + b.maxHp * heal);
       this.heroHp = Math.min(CFG.hero.hp, this.heroHp + CFG.hero.hp * heal);
-      this.banner(`Checkpoint ${this.passedCheckpoints}!`);
+      this.hud.banner(`Checkpoint ${this.passedCheckpoints}`);
     }
     if (x >= this.finishX) {
       this.passedCheckpoints = CFG.stage.sections;
       this.endStage(true);
     }
   }
+
+  endStage(won: boolean): void {
+    if (this.mode !== 'battle') return;
+    this.mode = won ? 'won' : 'lost';
+    this.aimPointer = null;
+    this.time.delayedCall(won ? 300 : 700, () => this.hud.showResult(won));
+  }
+
+  restartStage(): void {
+    this.scene.stop('hud');
+    this.scene.restart();
+  }
 }
+
+export type { Btn };

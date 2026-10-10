@@ -11,96 +11,120 @@ export type EnemyId = 'walker' | 'runner' | 'brute' | 'climber' | 'flyer';
 
 const DEFAULTS = {
   stage: {
-    length: 7200,            // px from start to finish line
+    length: 6000,            // px from start to the END flag
     sections: 5,             // checkpoints split the stage into this many sections
-    nestPositions: [0.26, 0.52, 0.8],   // spawner nests, as fraction of stage length
-    cratePositions: [0.12, 0.4, 0.66],  // free-block crates, as fraction of stage length
-    startGold: 120,
+    nestPositions: [0.18, 0.44, 0.72],  // spawner nests, as a fraction of stage length
+    cratePositions: [0.3, 0.58, 0.86],  // free-block crates
+    startGold: 475,
     difficulty: 1.0,         // global multiplier on enemy HP and damage
     hpGrowthPerSection: 0.3, // enemy HP +30% per section reached
     dmgGrowthPerSection: 0.12,
-    crateGoldIfFull: 40,     // crate pays gold instead if tower already has 6 blocks
-    checkpointHealPct: 0.15, // blocks + hero heal this fraction of max HP at each checkpoint
+    crateGoldIfFull: 60,     // crate pays gold instead if the tower already has 6 blocks
+    checkpointHealPct: 0.1,  // blocks + hero heal this fraction of max HP at each checkpoint
   },
   tower: {
-    cartSpeed: 40,           // px/s while the path is clear
+    cartSpeed: 45,           // px/s while the path is clear
     slowSpeedFactor: 0.5,    // speed factor when enemies are close ahead (but not touching)
-    slowDistance: 140,       // "close ahead" distance from the tower front
+    slowDistance: 120,
     maxBlocks: 6,
-    blockWidth: 96,
-    blockHeight: 60,
-    cartHeight: 34,
-    blockHp: 140,
-    blockCostBase: 40,       // first block
-    blockCostStep: 30,       // + this per block already on the tower
-    sellRefund: 0.5,         // fraction of gold spent on the block (incl. upgrades) returned
-    hpUpgradeCostBase: 30,
-    hpUpgradeCostStep: 25,   // + this per HP level already bought on that block
+    startBlocks: 1,
+    blockWidth: 70,
+    blockHeight: 58,
+    cartHeight: 30,
+    blockHp: 250,
+    blockCostBase: 100,      // "+" button: first extra block
+    blockCostStep: 50,       // + this per block already on the tower
+    blockSellRefund: 0.5,    // trash: fraction of gold spent on block + HP upgrades returned
+    hpUpgradeCostBase: 150,
+    hpUpgradeCostStep: 100,  // + this per HP level already bought on that block
     hpUpgradePct: 0.4,       // each HP level adds this fraction of base block HP
     dropSpeed: 600,          // px/s blocks fall when one below is destroyed
   },
+  weaponLevel: {
+    upgradeCostStep: 35,     // level n -> n+1 costs n * this
+    damagePerLevel: 0.2,     // +20% base damage per level
+    sellRefund: 1.0,         // SELL returns this fraction of gold spent on the weapon
+  },
+  energy: {
+    start: 5,
+    max: 30,
+    regen: 0.75,             // per second
+    regenUpgrade: 0.15,      // added per upgrade
+    upgradeCostBase: 30,
+    upgradeCostStep: 30,
+  },
+  grenade: { cost: 2, damage: 70, radius: 95, flightTime: 0.6 },
   hero: {
-    hp: 160,
-    range: 400,
-    fireInterval: 0.7,
-    pellets: 5,
-    pelletDamage: 6,
-    spreadDeg: 24,
+    hp: 300,
+    range: 430,
+    fireInterval: 0.6,
+    aimFireInterval: 0.45,   // faster fire while you hold to aim
+    pellets: 3,
+    pelletDamage: 9,
+    spreadDeg: 12,
     pelletSpeed: 950,
-    aimFireInterval: 0.55,   // faster fire while you hold to aim
   },
   weapons: {
-    saw:       { damage: 5,  interval: 0.1,  range: 64 },
-    shocker:   { damage: 8,  interval: 0.18, range: 150, chain: 2, chainRange: 80 },
-    flame:     { damage: 2.6, interval: 0.1, range: 220, coneDeg: 34 },
-    laser:     { damage: 26, interval: 1.1,  range: 320, beamWidth: 16 },
-    mg:        { damage: 5,  interval: 0.12, range: 500, speed: 1200 },
-    rocket:    { damage: 30, interval: 1.8,  range: 460, speed: 520, splash: 80 },
-    cryo:      { damage: 11, interval: 0.55, range: 240, speed: 700, slowPct: 0.5, slowTime: 2.0, freezeStacks: 3, freezeTime: 1.4 },
-    boomerang: { damage: 15, interval: 1.4,  range: 340, speed: 560, arc: 55 },
+    saw:       { price: 100, damage: 4,  interval: 0.1,  range: 46 },
+    shocker:   { price: 150, damage: 8,  interval: 0.2,  range: 150, chain: 2, chainRange: 80 },
+    flame:     { price: 250, damage: 3,  interval: 0.1,  range: 210, coneDeg: 26 },
+    laser:     { price: 300, damage: 30, interval: 1.2,  range: 340, beamWidth: 14 },
+    mg:        { price: 300, damage: 7,  interval: 0.12, range: 480, speed: 1100 },
+    rocket:    { price: 375, damage: 45, interval: 1.8,  range: 470, speed: 520, splash: 80 },
+    cryo:      { price: 350, damage: 12, interval: 0.6,  range: 260, speed: 700, slowPct: 0.5, slowTime: 2, freezeStacks: 3, freezeTime: 1.4 },
+    boomerang: { price: 250, damage: 20, interval: 1.4,  range: 340, speed: 560, arc: 50 },
+  },
+  // Active abilities (energy). Activating one fires it on every weapon of that type.
+  abilities: {
+    saw:       { cost: 5, duration: 5, damageMult: 3, rangeMult: 2 },
+    shocker:   { cost: 8, damage: 60, radius: 380, stun: 1.5 },
+    flame:     { cost: 7, duration: 3, damage: 7, interval: 0.08, range: 330, coneDeg: 46 },
+    laser:     { cost: 8, duration: 2.5, damage: 14, interval: 0.1, beamWidth: 44 },
+    mg:        { cost: 6, duration: 4, rateMult: 4 },
+    rocket:    { cost: 8, count: 8, damage: 60, splash: 100 },
+    cryo:      { cost: 9, freezeTime: 3, damage: 25, radius: 650 },
+    boomerang: { cost: 6, count: 3 },
   },
   enemies: {
-    walker:  { hp: 45,  speed: 44,  damage: 7,  attackInterval: 1.0, w: 30, h: 46, gold: 2,  climbSpeed: 55 },
-    runner:  { hp: 28,  speed: 100,  damage: 5,  attackInterval: 0.7, w: 26, h: 40, gold: 2,  climbSpeed: 80 },
-    brute:   { hp: 260, speed: 28,  damage: 22, attackInterval: 1.4, w: 52, h: 70, gold: 10, climbSpeed: 0 },
-    climber: { hp: 34,  speed: 62,  damage: 6,  attackInterval: 0.8, w: 26, h: 38, gold: 3,  climbSpeed: 170 },
-    flyer:   { hp: 30,  speed: 75,  damage: 6,  attackInterval: 1.1, w: 34, h: 24, gold: 4,  climbSpeed: 0 },
+    walker:  { hp: 50,  speed: 42, damage: 9,  attackInterval: 1.0, gold: 5,  climbSpeed: 55,  scale: 1 },
+    runner:  { hp: 30,  speed: 95, damage: 6,  attackInterval: 0.7, gold: 5,  climbSpeed: 80,  scale: 0.9 },
+    brute:   { hp: 260, speed: 26, damage: 26, attackInterval: 1.4, gold: 20, climbSpeed: 0,   scale: 1.5 },
+    climber: { hp: 36,  speed: 60, damage: 7,  attackInterval: 0.8, gold: 6,  climbSpeed: 170, scale: 0.85 },
+    flyer:   { hp: 34,  speed: 75, damage: 7,  attackInterval: 1.1, gold: 8,  climbSpeed: 0,   scale: 1 },
   },
   physics: {
     fallSpeed: 420,
-    crowdOverlap: 0.75,      // how tightly zombies bunch (1 = touching, lower = overlap)
+    crowdOverlap: 0.7,       // how tightly zombies bunch (1 = touching, lower = overlap)
     stepUp: 8,
   },
   nest: {
-    hp: 900,
-    spawnInterval: 1.5,
-    activationRange: 900,    // starts spawning when the tower is this close
-    gold: 60,
-    width: 110,
-    height: 150,
-    blockGap: 50,            // tower stops this far before an alive nest
+    hp: 1800,
+    spawnInterval: 1.6,
+    activationRange: 800,    // starts spawning when the tower is this close
+    gold: 150,
+    blockGap: 40,            // tower stops this far before an alive nest
     runnerChance: 0.3,
     climberChance: 0.15,
   },
   spawns: {
-    startDelay: 3,
-    interval: 1.5,           // ambient spawn interval in section 1 (seconds)
-    intervalFactorPerSection: 0.82,
+    startDelay: 2,
+    interval: 1.7,           // ambient spawn interval in section 1 (seconds)
+    intervalFactorPerSection: 0.84,
     groupMin: 2,
     groupMax: 5,
-    runnerChance: 0.22,
-    bruteChance: 0.06,
+    runnerChance: 0.2,
+    bruteChance: 0.05,
     climberChance: 0.12,
-    flyerChance: 0.09,
-    flyerAltMin: 260,
-    flyerAltMax: 460,
-    maxAlive: 80,
+    flyerChance: 0.08,
+    flyerAltMin: 200,
+    flyerAltMax: 330,
+    maxAlive: 70,
   },
 };
 
 export type Config = typeof DEFAULTS;
 
-const STORAGE_KEY = 'stackrunner.tuning.v1';
+const STORAGE_KEY = 'stackwagon.tuning.v2';
 
 function clone<T>(v: T): T {
   return JSON.parse(JSON.stringify(v));

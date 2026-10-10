@@ -1,42 +1,22 @@
-import type { EnemyId, WeaponId } from '../config';
+import type { WeaponId } from '../config';
 
 // Display info and fixed behaviour flags (not tuning numbers).
 export interface WeaponMeta {
   name: string;
-  short: string;
-  color: number;
+  icon: string;          // texture key
   hitsAir: boolean;
   reach: 'Short' | 'Mid' | 'Long';
-  desc: string;
+  ability: string;
+  mountX: number;        // texture origin x (0..1) where it attaches to the block
 }
 
 export const WEAPONS: Record<WeaponId, WeaponMeta> = {
-  saw:       { name: 'Saw',          short: 'SAW', color: 0xa0a0a0, hitsAir: false, reach: 'Short', desc: 'Constant contact damage. Put it low.' },
-  shocker:   { name: 'Shocker',      short: 'ZAP', color: 0xe8d44d, hitsAir: true, reach: 'Short', desc: 'Rapid zaps that chain between zombies.' },
-  flame:     { name: 'Flamethrower', short: 'FLM', color: 0xe8843a, hitsAir: true,  reach: 'Mid',   desc: 'Cone splash. Hits ground and air.' },
-  laser:     { name: 'Laser',        short: 'LSR', color: 0xd04de8, hitsAir: true,  reach: 'Mid',   desc: 'Beam pierces everything in a line.' },
-  mg:        { name: 'Machine Gun',  short: 'MG',  color: 0x6f8fb0, hitsAir: true,  reach: 'Long',  desc: 'High single-target damage, any floor.' },
-  rocket:    { name: 'Rocket',       short: 'RKT', color: 0xc84b4b, hitsAir: false, reach: 'Long',  desc: 'Slow explosive splash on the ground.' },
-  cryo:      { name: 'Cryo Gun',     short: 'ICE', color: 0x7fd6f0, hitsAir: true,  reach: 'Mid',   desc: 'Slows, then freezes solid.' },
-  boomerang: { name: 'Boomerang',    short: 'BMR', color: 0x8fc46a, hitsAir: false, reach: 'Mid',   desc: 'Arcs out and back, hitting both ways.' },
-};
-
-export const ENEMY_COLORS: Record<EnemyId, number> = {
-  walker: 0x6f8f5f,
-  runner: 0x9bb860,
-  brute: 0x4f6446,
-  climber: 0x6f9d8c,
-  flyer: 0x8d6aa0,
-};
-
-export const UI = {
-  bg: 0x2b2f38,
-  panel: 0x1d2027,
-  panelLight: 0x3a3f4b,
-  text: '#f2f2f2',
-  dim: '#9aa0aa',
-  gold: '#ffd166',
-  good: 0x4caf6a,
-  bad: 0xd9534f,
-  font: '-apple-system, "Helvetica Neue", Arial, sans-serif',
+  saw:       { name: 'Saw',          icon: 'w_saw',       hitsAir: false, reach: 'Short', ability: 'Overdrive',     mountX: 0.05 },
+  shocker:   { name: 'Shocker',      icon: 'w_shocker',   hitsAir: true,  reach: 'Short', ability: 'Shock Wave',    mountX: 0.5 },
+  flame:     { name: 'Flamethrower', icon: 'w_flame',     hitsAir: true,  reach: 'Mid',   ability: 'Inferno',       mountX: 0.1 },
+  laser:     { name: 'Laser',        icon: 'w_laser',     hitsAir: true,  reach: 'Mid',   ability: 'Mega Beam',     mountX: 0.1 },
+  mg:        { name: 'Machine Gun',  icon: 'w_mg',        hitsAir: true,  reach: 'Long',  ability: 'Bullet Storm',  mountX: 0.1 },
+  rocket:    { name: 'Rocket',       icon: 'w_rocket',    hitsAir: false, reach: 'Long',  ability: 'Barrage',       mountX: 0.1 },
+  cryo:      { name: 'Cryo Gun',     icon: 'w_cryo',      hitsAir: true,  reach: 'Mid',   ability: 'Deep Freeze',   mountX: 0.1 },
+  boomerang: { name: 'Boomerang',    icon: 'w_boomerang', hitsAir: false, reach: 'Mid',   ability: 'Triple Throw',  mountX: 0.1 },
 };

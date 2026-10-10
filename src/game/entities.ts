@@ -1,16 +1,18 @@
 import Phaser from 'phaser';
 import { CFG, EnemyId } from '../config';
-import { ENEMY_COLORS } from './meta';
+import { fmt, txt } from '../art';
 
 export interface Target {
   x: number;
-  readonly y: number;
+  readonly y: number;     // centre
   w: number;
   h: number;
   isAir: boolean;
   alive: boolean;
   hp: number;
   maxHp: number;
+  dmgAcc: number;         // damage accumulated for the floating number
+  numTimer: number;
   hit(dmg: number): void;
 }
 
@@ -44,35 +46,31 @@ export class Zombie implements Target {
   frozenTimer = 0;
   flash = 0;
   lunge = 0;
-  bobPhase = Math.random() * Math.PI * 2;
-  body: Phaser.GameObjects.Rectangle;
-  head: Phaser.GameObjects.Rectangle;
+  dmgAcc = 0;
+  numTimer = 0;
+  anim = Math.random() * 10;
+  sprite: Phaser.GameObjects.Image;
 
   constructor(private scene: Phaser.Scene & HitHost, kind: EnemyId, x: number, alt: number, hpMult: number, dmgMult: number) {
     const c = CFG.enemies[kind];
     this.kind = kind;
     this.x = x;
     this.alt = alt;
-    this.w = c.w;
-    this.h = c.h;
     this.hp = this.maxHp = c.hp * hpMult;
-    this.speed = c.speed * (0.9 + Math.random() * 0.2);
+    this.speed = c.speed * (0.88 + Math.random() * 0.24);
     this.damage = c.damage * dmgMult;
     this.attackInterval = c.attackInterval;
     this.attackTimer = Math.random() * c.attackInterval;
     this.climbSpeed = c.climbSpeed;
     this.gold = c.gold;
     this.isAir = kind === 'flyer';
-    const color = ENEMY_COLORS[kind];
-    this.body = scene.add.rectangle(x, this.y, this.w, this.h, color).setStrokeStyle(2, 0x1a1a1a).setDepth(10);
-    const headH = this.isAir ? this.h * 0.6 : Math.min(18, this.h * 0.35);
-    this.head = scene.add.rectangle(x, this.y, this.w * 0.7, headH, Phaser.Display.Color.ValueToColor(color).darken(18).color)
-      .setStrokeStyle(1, 0x1a1a1a).setDepth(11);
+    this.sprite = scene.add.image(x, 0, `z_${kind}_0`).setOrigin(0.5, 1).setScale(c.scale).setDepth(10 + Math.random());
+    this.w = this.sprite.displayWidth * (this.isAir ? 0.7 : 0.62);
+    this.h = this.sprite.displayHeight * 0.95;
   }
 
   get y(): number {
-    const bob = this.isAir ? Math.sin(this.bobPhase) * 6 : 0;
-    return this.scene.groundY - this.alt - this.h / 2 + bob;
+    return this.scene.groundY - this.alt - this.h / 2;
   }
 
   get top(): number {
@@ -87,7 +85,8 @@ export class Zombie implements Target {
   hit(dmg: number): void {
     if (!this.alive) return;
     this.hp -= dmg;
-    this.flash = 0.08;
+    this.dmgAcc += dmg;
+    this.flash = 0.06;
     if (this.hp <= 0) {
       this.alive = false;
       this.scene.onEnemyKilled(this, this.gold);
@@ -105,32 +104,37 @@ export class Zombie implements Target {
     }
   }
 
+  freeze(t: number): void {
+    this.frozenTimer = Math.max(this.frozenTimer, t);
+  }
+
   tickStatus(dt: number): void {
     this.flash = Math.max(0, this.flash - dt);
     this.slowTimer = Math.max(0, this.slowTimer - dt);
     if (this.slowTimer === 0) { this.slowPct = 0; this.chill = 0; }
     this.frozenTimer = Math.max(0, this.frozenTimer - dt);
     this.lunge = Math.max(0, this.lunge - dt);
-    if (this.isAir && this.frozenTimer === 0) this.bobPhase += dt * 5;
+    const moving = this.frozenTimer === 0 && (!this.blocked || this.climbing || this.isAir);
+    if (moving) this.anim += dt * (this.speed / 10) * this.speedMult;
   }
 
   draw(): void {
-    const lungeX = this.lunge > 0 ? -5 : 0;
-    const y = this.y;
-    this.body.setPosition(this.x + lungeX, y);
-    const headY = this.isAir ? y : y - this.h / 2 + this.head.height / 2 + 2;
-    this.head.setPosition(this.x + lungeX - (this.isAir ? 0 : 3), headY);
-    const base = ENEMY_COLORS[this.kind];
-    let fill = base;
-    if (this.flash > 0) fill = 0xffffff;
-    else if (this.frozenTimer > 0) fill = 0xc8ecff;
-    else if (this.slowTimer > 0) fill = 0x8fb8c8;
-    this.body.setFillStyle(fill);
+    const s = this.sprite;
+    const frame = Math.floor(this.anim) % 2;
+    s.setTexture(`z_${this.kind}_${frame}`);
+    const bob = this.isAir ? Math.sin(this.anim * 0.8) * 5 : (frame ? -1.5 : 0);
+    const lungeX = this.lunge > 0 ? -6 : 0;
+    s.setPosition(this.x + lungeX, this.scene.groundY - this.alt + bob - (this.isAir ? this.h / 2 : 0));
+    if (this.isAir) s.setOrigin(0.5, 0.5);
+    s.rotation = this.attacking && this.lunge > 0 ? -0.15 : this.climbing ? 0.25 : Math.sin(this.anim * Math.PI) * 0.05;
+    if (this.flash > 0) s.setTintFill(0xffffff);
+    else if (this.frozenTimer > 0) s.setTint(0x9fe3ff);
+    else if (this.slowTimer > 0) s.setTint(0xcdeeff);
+    else s.clearTint();
   }
 
   destroy(): void {
-    this.body.destroy();
-    this.head.destroy();
+    this.sprite.destroy();
   }
 }
 
@@ -142,23 +146,24 @@ export class Nest implements Target {
   maxHp: number;
   isAir = false;
   alive = true;
-  spawnTimer = 1;
+  spawnTimer = 0.5;
   flash = 0;
-  rect: Phaser.GameObjects.Rectangle;
+  dmgAcc = 0;
+  numTimer = 0;
+  body: Phaser.GameObjects.Image;
+  door: Phaser.GameObjects.Image;
   label: Phaser.GameObjects.Text;
-  spikes: Phaser.GameObjects.Rectangle[] = [];
+  bar: Phaser.GameObjects.Graphics;
 
   constructor(private scene: Phaser.Scene & HitHost, x: number, hpMult: number) {
     this.x = x;
-    this.w = CFG.nest.width;
-    this.h = CFG.nest.height;
     this.hp = this.maxHp = CFG.nest.hp * hpMult;
-    this.rect = scene.add.rectangle(x, this.y, this.w, this.h, 0x5a4a3f).setStrokeStyle(3, 0x221a15).setDepth(5);
-    for (let i = 0; i < 3; i++) {
-      this.spikes.push(scene.add.rectangle(x - this.w / 3 + (i * this.w) / 3, this.y - this.h / 2 - 12, 14, 24, 0x3f342c).setDepth(5));
-    }
-    this.label = scene.add.text(x, this.y, 'NEST', { fontSize: '18px', color: '#e6d2c0', fontStyle: 'bold' })
-      .setOrigin(0.5).setDepth(6);
+    this.door = scene.add.image(x - 52, scene.groundY + 2, 'nest_door').setOrigin(0.5, 1).setRotation(-0.12).setDepth(5);
+    this.body = scene.add.image(x, scene.groundY + 4, 'nest').setOrigin(0.5, 1).setDepth(6);
+    this.w = 100;
+    this.h = 84;
+    this.label = txt(scene, x, scene.groundY - 128, fmt(this.hp), 20).setDepth(30);
+    this.bar = scene.add.graphics().setDepth(30);
   }
 
   get y(): number {
@@ -168,6 +173,7 @@ export class Nest implements Target {
   hit(dmg: number): void {
     if (!this.alive) return;
     this.hp -= dmg;
+    this.dmgAcc += dmg;
     this.flash = 0.06;
     if (this.hp <= 0) {
       this.alive = false;
@@ -177,30 +183,34 @@ export class Nest implements Target {
 
   draw(dt: number): void {
     this.flash = Math.max(0, this.flash - dt);
-    this.rect.setFillStyle(this.flash > 0 ? 0xffffff : 0x5a4a3f);
+    if (!this.alive) return;
+    if (this.flash > 0) this.body.setTintFill(0xffffff);
+    else this.body.clearTint();
+    this.label.setText(fmt(this.hp));
+    const g = this.bar;
+    g.clear();
+    const bw = 44;
+    const by = this.scene.groundY - 110;
+    g.fillStyle(0x2b2433, 1);
+    g.fillRoundedRect(this.x - bw / 2 - 2, by - 2, bw + 4, 10, 4);
+    g.fillStyle(0xf07a2a, 1);
+    g.fillRoundedRect(this.x - bw / 2, by, bw * Math.max(0, this.hp / this.maxHp), 6, 3);
   }
 
-  destroy(): void {
-    this.rect.destroy();
+  wreck(): void {
+    this.body.setTint(0x555566).setAlpha(0.6);
+    this.door.setRotation(-1.2).setAlpha(0.6);
     this.label.destroy();
-    this.spikes.forEach((s) => s.destroy());
+    this.bar.destroy();
   }
 }
 
 export class Crate {
   taken = false;
-  rect: Phaser.GameObjects.Rectangle;
-  label: Phaser.GameObjects.Text;
+  sprite: Phaser.GameObjects.Image;
 
   constructor(scene: Phaser.Scene & HitHost, public x: number) {
-    const y = scene.groundY - 22;
-    this.rect = scene.add.rectangle(x, y, 44, 44, 0xb08850).setStrokeStyle(3, 0x5a4020).setDepth(6);
-    this.label = scene.add.text(x, y, '+1\nBLOCK', { fontSize: '11px', color: '#2a1a08', align: 'center', fontStyle: 'bold' })
-      .setOrigin(0.5).setDepth(7);
-  }
-
-  destroy(): void {
-    this.rect.destroy();
-    this.label.destroy();
+    this.sprite = scene.add.image(x, scene.groundY + 2, 'crate').setOrigin(0.5, 1).setDepth(7);
+    scene.tweens.add({ targets: this.sprite, y: scene.groundY - 6, yoyo: true, repeat: -1, duration: 600, ease: 'Sine.inOut' });
   }
 }

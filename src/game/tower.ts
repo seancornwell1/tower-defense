@@ -3,46 +3,41 @@ import { CFG, WeaponId } from '../config';
 import { WEAPONS } from './meta';
 
 export interface Block {
-  weapon: WeaponId;
+  weapon: WeaponId | null;
+  level: number;          // weapon level (1+)
+  weaponSpent: number;    // gold spent on the weapon + its levels
+  blockSpent: number;     // gold spent on the block + HP levels
   hp: number;
   maxHp: number;
   hpLevel: number;
-  spent: number;          // gold paid in total (block + HP upgrades), for refunds
-  visY: number;           // current displayed centre y (falls toward its slot)
+  visY: number;           // displayed centre y (falls toward its slot)
   cooldown: number;
-  spin: number;           // saw blade angle / misc animation
   flash: number;
+  hitShow: number;        // seconds left to show the HP bar after a hit
   boomerangOut: boolean;
+  aim: number;
   container: Phaser.GameObjects.Container;
-  body: Phaser.GameObjects.Rectangle;
-  turret: Phaser.GameObjects.Rectangle;
-  barrel: Phaser.GameObjects.Rectangle;
-  blade?: Phaser.GameObjects.Rectangle;
-  label: Phaser.GameObjects.Text;
+  body: Phaser.GameObjects.Image;
+  gun: Phaser.GameObjects.Image | null;
+  blade: Phaser.GameObjects.Image | null;
 }
 
 export class Tower {
   x: number;
   blocks: Block[] = [];
-  cart: Phaser.GameObjects.Rectangle;
-  wheels: Phaser.GameObjects.Arc[] = [];
-  wheelSpin = 0;
+  cart: Phaser.GameObjects.Image;
+  wheels: Phaser.GameObjects.Image[] = [];
 
   constructor(private scene: Phaser.Scene, x: number, private groundY: number) {
     this.x = x;
-    const ch = CFG.tower.cartHeight;
-    this.cart = scene.add.rectangle(x, groundY - ch / 2 - 6, CFG.tower.blockWidth + 16, ch - 10, 0x6b5a48)
-      .setStrokeStyle(3, 0x2a221a).setDepth(20);
-    for (const dx of [-36, 0, 36]) {
-      this.wheels.push(scene.add.circle(x + dx, groundY - 10, 10, 0x2a2a2a).setStrokeStyle(3, 0x777777).setDepth(21));
-    }
+    this.cart = scene.add.image(x, groundY - 14, 'cart').setDepth(21);
+    for (const dx of [-26, 26]) this.wheels.push(scene.add.image(x + dx, groundY - 12, 'wheel').setDepth(22));
   }
 
   get bw(): number { return CFG.tower.blockWidth; }
   get bh(): number { return CFG.tower.blockHeight; }
-  get frontX(): number { return this.x + this.bw / 2; }
+  get frontX(): number { return this.x + this.bw / 2 + 8; }
 
-  /** Altitude (above ground) of the top of the stack. */
   get topAlt(): number {
     return CFG.tower.cartHeight + this.bh * this.blocks.length;
   }
@@ -57,38 +52,50 @@ export class Tower {
     return top ? top.visY - this.bh / 2 : this.groundY - CFG.tower.cartHeight;
   }
 
-  turretPos(b: Block): { x: number; y: number } {
-    return { x: this.x + this.bw / 2 - 14, y: b.visY - 6 };
+  muzzle(b: Block): { x: number; y: number } {
+    return { x: this.x + this.bw / 2 + 4, y: b.visY + 6 };
   }
 
-  addBlock(weapon: WeaponId, spent: number): Block {
-    const meta = WEAPONS[weapon];
+  addBlock(spent: number): Block {
     const i = this.blocks.length;
     const y = this.slotY(i);
-    const bw = this.bw;
-    const bh = this.bh;
-    const body = this.scene.add.rectangle(0, 0, bw - 4, bh - 4, 0x8a8f99).setStrokeStyle(3, 0x3a3d44);
-    const stripe = this.scene.add.rectangle(-bw / 2 + 10, 0, 10, bh - 10, meta.color);
-    const turret = this.scene.add.rectangle(bw / 2 - 18, -6, 26, 22, meta.color).setStrokeStyle(2, 0x222222);
-    const barrel = this.scene.add.rectangle(bw / 2 - 18, -6, 34, 7, 0x2e2e2e).setOrigin(0, 0.5);
-    const label = this.scene.add.text(-10, 12, meta.short, { fontSize: '14px', color: '#1d1f24', fontStyle: 'bold' }).setOrigin(0.5);
-    const parts: Phaser.GameObjects.GameObject[] = [body, stripe, barrel, turret, label];
-    let blade: Phaser.GameObjects.Rectangle | undefined;
-    if (weapon === 'saw') {
-      barrel.setVisible(false);
-      blade = this.scene.add.rectangle(bw / 2 + 8, 8, 30, 30, 0xcfcfcf).setStrokeStyle(2, 0x444444);
-      parts.push(blade);
-    }
-    const container = this.scene.add.container(this.x, y, parts).setDepth(20);
-    body.setInteractive({ useHandCursor: true });
+    const body = this.scene.add.image(0, 0, 'block').setDisplaySize(this.bw + 2, this.bh + 2);
+    const container = this.scene.add.container(this.x, y, [body]).setDepth(20);
+    body.setInteractive();
     const block: Block = {
-      weapon, hp: CFG.tower.blockHp, maxHp: CFG.tower.blockHp, hpLevel: 0, spent,
-      visY: i === 0 ? y : Math.min(y, this.visTopY - bh / 2), cooldown: Math.random() * 0.3, spin: 0, flash: 0,
-      boomerangOut: false, container, body, turret, barrel, blade, label,
+      weapon: null, level: 0, weaponSpent: 0, blockSpent: spent,
+      hp: CFG.tower.blockHp, maxHp: CFG.tower.blockHp, hpLevel: 1,
+      visY: i === 0 ? y : y - 40, cooldown: 0, flash: 0, hitShow: 0, boomerangOut: false, aim: 0,
+      container, body, gun: null, blade: null,
     };
     body.setData('block', block);
     this.blocks.push(block);
     return block;
+  }
+
+  setWeapon(b: Block, w: WeaponId | null, spent: number): void {
+    b.gun?.destroy();
+    b.blade?.destroy();
+    b.gun = null;
+    b.blade = null;
+    b.weapon = w;
+    b.level = w ? 1 : 0;
+    b.weaponSpent = w ? spent : 0;
+    b.cooldown = 0.2;
+    if (!w) return;
+    const m = WEAPONS[w];
+    const gx = this.bw / 2 - 12;
+    const gy = 6;
+    if (w === 'shocker') {
+      b.gun = this.scene.add.image(gx, gy + 6, m.icon).setOrigin(0.5, 1);
+    } else {
+      b.gun = this.scene.add.image(gx, gy, m.icon).setOrigin(m.mountX, 0.5);
+    }
+    b.container.add(b.gun);
+    if (w === 'saw') {
+      b.blade = this.scene.add.image(gx + 40, gy, 'saw_blade');
+      b.container.add(b.blade);
+    }
   }
 
   removeBlock(b: Block): void {
@@ -98,11 +105,11 @@ export class Tower {
   }
 
   blockCost(): number {
-    return CFG.tower.blockCostBase + CFG.tower.blockCostStep * this.blocks.length;
+    return CFG.tower.blockCostBase + CFG.tower.blockCostStep * Math.max(0, this.blocks.length - CFG.tower.startBlocks);
   }
 
   hpUpgradeCost(b: Block): number {
-    return CFG.tower.hpUpgradeCostBase + CFG.tower.hpUpgradeCostStep * b.hpLevel;
+    return CFG.tower.hpUpgradeCostBase + CFG.tower.hpUpgradeCostStep * (b.hpLevel - 1);
   }
 
   upgradeHp(b: Block, cost: number): void {
@@ -110,10 +117,10 @@ export class Tower {
     b.maxHp += add;
     b.hp += add;
     b.hpLevel++;
-    b.spent += cost;
+    b.blockSpent += cost;
   }
 
-  /** Index of the block a zombie at this altitude band would hit (-1 = hero). */
+  /** Index of the block a zombie at this altitude would hit (-1 = hero). */
   blockIndexAtAlt(alt: number): number {
     const n = this.blocks.length;
     if (n === 0) return -1;
@@ -122,28 +129,25 @@ export class Tower {
     return Math.max(0, i);
   }
 
-  update(dt: number, moving: number, dragged: Block | null, dragIndex: number): void {
+  update(dt: number, moved: number, dragged: Block | null, dragIndex: number): void {
     this.cart.x = this.x;
-    this.wheelSpin += moving * dt * 0.1;
     this.wheels.forEach((w, k) => {
-      w.x = this.x + (k - 1) * 36;
-      w.rotation = this.wheelSpin;
+      w.x = this.x + (k ? 26 : -26);
+      w.rotation += moved / 12;
     });
-    // Order used for layout: while dragging, the dragged block is shown at its prospective slot.
     const order = this.blocks.filter((b) => b !== dragged);
     if (dragged) order.splice(dragIndex, 0, dragged);
     order.forEach((b, i) => {
-      const target = this.slotY(i);
+      b.flash = Math.max(0, b.flash - dt);
+      b.hitShow = Math.max(0, b.hitShow - dt);
+      if (b.flash > 0) b.body.setTint(0xff9a8a);
+      else b.body.clearTint();
+      if (b.blade) b.blade.rotation += dt * 16;
       if (b === dragged) return;
+      const target = this.slotY(i);
       if (b.visY < target) b.visY = Math.min(target, b.visY + CFG.tower.dropSpeed * dt);
       else b.visY = Math.max(target, b.visY - CFG.tower.dropSpeed * 2 * dt);
-      b.flash = Math.max(0, b.flash - dt);
       b.container.setPosition(this.x, b.visY);
-      b.body.setFillStyle(b.flash > 0 ? 0xffb0a0 : 0x8a8f99);
-      if (b.blade) {
-        b.spin += dt * 14;
-        b.blade.rotation = b.spin;
-      }
     });
   }
 }
